@@ -6,6 +6,8 @@ Follows the same conventions as [mysa2mqtt](https://github.com/bourquep/mysa2mqt
 
 > **Disclaimer:** This project was built through reverse engineering of the Moovair Android APK. It is not affiliated with or endorsed by Moovair or Midea.
 >
+> ⚠️ **Stability warning:** This bridge relies entirely on Moovair's **undocumented private cloud API**. If Moovair changes their API, authentication system, or encryption at any time, this bridge may stop working with no warning. Use it knowing this risk.
+>
 > **A note from the author:** I am not a programmer — this entire project was built with the help of [Claude Code](https://claude.ai/code) (AI-assisted development). If you run into issues or have questions, I'll do my best to help, but please keep in mind that my ability to debug code is very limited. That said, feel free to open an issue — maybe someone in the community can step in! 😄
 
 ---
@@ -26,9 +28,10 @@ Follows the same conventions as [mysa2mqtt](https://github.com/bourquep/mysa2mqt
 
 ## Requirements
 
-- A Moovair account (email + password from the Moovair app)
-- An MQTT broker (e.g. Mosquitto)
-- Home Assistant with the MQTT integration enabled
+- **Docker** (to run the bridge as a container)
+- **An MQTT broker** — e.g. [Mosquitto](https://mosquitto.org/). If you're on TrueNAS Scale or similar, you likely already have one running.
+- **Home Assistant** with the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) enabled
+- **A Moovair account** (email + password from the Moovair app)
 
 > ⚠️ **Known limitation:** The Moovair cloud only allows **one active session at a time**. The Moovair app and this bridge cannot run simultaneously — the bridge takes over the session.
 
