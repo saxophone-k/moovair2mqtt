@@ -1,0 +1,19 @@
+services:
+  moovair2mqtt:
+    image: moovair2mqtt:latest   # ou ghcr.io/tonuser/moovair2mqtt:latest
+    restart: unless-stopped
+    environment:
+      # ── Compte Moovair (obligatoire) ───────────────────────────────────
+      M2M_MOOVAIR_USERNAME: "ton.email@example.com"
+      M2M_MOOVAIR_PASSWORD: "ton_password"
+
+      # ── Broker MQTT (obligatoire) ──────────────────────────────────────
+      M2M_MQTT_HOST: "192.168.1.x"     # IP de ton Mosquitto / TrueNAS
+      M2M_MQTT_PORT: "1883"
+      # M2M_MQTT_USERNAME: ""           # si ton broker a un mdp
+      # M2M_MQTT_PASSWORD: ""
+
+      # ── Options (optionnel) ────────────────────────────────────────────
+      M2M_POLL_INTERVAL: "30"           # secondes entre chaque lecture
+      M2M_MQTT_TOPIC_PREFIX: "moovair2mqtt"
+      M2M_LOG_LEVEL: "info"             # debug, info, warning, error
