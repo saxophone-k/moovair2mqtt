@@ -184,22 +184,13 @@ class MoovairCloud:
         total     = struct.unpack('<H', m0_bytes[4:6])[0]
         return m0_bytes[40:40 + (total - 56)]
 
-    async def _data2json(self, payload_bytes):
-        hex_str = ",".join(f"{b:02x}" for b in payload_bytes)
-        return await self._lua_request("/v1/luacontrol/data2json", {
-            "message": {"data": hex_str},
-            "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
-        })
-
     async def read_state(self, appliance_id):
         result = await self._lua_request("/v1/luacontrol/json2data", {
             "query": {"query_type": "query_all,display_status_query,central_control_special_data_query,indoor_run_status"},
             "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
         })
         payload = await self._transparent_send(appliance_id, result["result"])
-        status  = await self._data2json(payload)
-        log.debug("data2json status: %s", status)
-        return _decode_state(status)
+        return _decode_state(payload)
 
     async def send_control(self, appliance_id, *, setpoint_c, hvac_mode, fan_mode="auto"):
         mode_lua = MODE_WRITE.get(hvac_mode, 4)
@@ -221,44 +212,33 @@ class MoovairCloud:
         await self._client.aclose()
 
 
-def _decode_state(status):
-    is_celsius = status.get("temperature_unit", 0) == 0
+def _decode_state(payload):
+    indoor_f   = payload[16]
+    indoor_c   = round((indoor_f - 32) / 1.8, 1)
+    setpoint_c = (payload[22] - 50) / 2
+    power      = payload[17]
+    mode_byte  = payload[21]
+    heat_pump  = payload[18] == 8
+    fan_raw    = payload[23]
 
-    if str(status.get("support_0.01_precision_follow_sense", "0")) == "1":
-        raw_temp = float(status.get("high_precision_temp_sensor_value", 0))
-    else:
-        raw_temp = float(status.get("screen_temperature_sensor_value", 0))
-    indoor_c = round(raw_temp if is_celsius else (raw_temp - 32) / 1.8, 1)
-
-    setpoint_raw = float(status.get("temperature", 20))
-    setpoint_c   = setpoint_raw if is_celsius else round((setpoint_raw - 32) / 1.8, 1)
-
-    power     = status.get("power", "off") == "on"
-    mode_byte = int(status.get("mode", 4))
-    sep_ptc   = int(status.get("separate_ptc_mode_switch", 0))
-    ptc_on    = status.get("ptc", "off") == "on"
-    heating   = bool(int(status.get("outdoor_compressor_operating_status", 0)))
-    fan_raw   = int(status.get("wind_speed", 102))
-
-    if not power:
-        hvac_mode = "off";       action = "off"
-    elif mode_byte == 1: hvac_mode = "heat_cool";     action = "heating" if heating else "idle"
-    elif mode_byte == 2: hvac_mode = "cool";           action = "cooling" if heating else "idle"
-    elif mode_byte == 3: hvac_mode = "dry";            action = "drying"  if heating else "idle"
-    elif mode_byte == 4:
-        hvac_mode = "emergency_heat" if sep_ptc else "heat"
-        action = "heating" if heating else "idle"
-    elif mode_byte == 5: hvac_mode = "fan_only";      action = "fan"
-    else:                hvac_mode = "off";            action = "off"
+    if power == 0:
+        hvac_mode = "off"
+        action    = "off"
+    elif mode_byte == 1: hvac_mode = "heat_cool";  action = "heating" if payload[85] else "idle"
+    elif mode_byte == 2: hvac_mode = "cool";        action = "cooling" if payload[85] else "idle"
+    elif mode_byte == 3: hvac_mode = "dry";         action = "drying"  if payload[85] else "idle"
+    elif mode_byte == 4: hvac_mode = "heat";        action = "heating" if payload[85] else "idle"
+    elif mode_byte == 5: hvac_mode = "fan_only";    action = "fan"
+    else:                hvac_mode = "off";         action = "off"
 
     return {
         "hvac_mode":    hvac_mode,
         "action":       action,
-        "aux_heat":     ptc_on and power and mode_byte == 4 and not sep_ptc,
+        "aux_heat":     power == 1 and mode_byte == 4 and not heat_pump,
         "current_temp": indoor_c,
         "setpoint":     setpoint_c,
         "fan_mode":     FAN_READ.get(fan_raw, "auto"),
-        "heating":      heating,
+        "heating":      bool(payload[85]),
     }
 
 
