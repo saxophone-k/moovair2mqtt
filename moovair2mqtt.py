@@ -19,6 +19,7 @@ import httpx
 import paho.mqtt.client as mqtt
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
+from firebase_messaging import FcmPushClient, FcmRegisterConfig
 
 # ── Configuration depuis variables d'environnement ───────────────────────────
 
@@ -56,6 +57,12 @@ SRC          = "17"
 APPLIANCE_ID = None   # découvert au login
 DEVICE_SN    = "bridge"
 
+# ── Firebase Cloud Messaging (température ambiante via push) ──────────────────
+FCM_SENDER_ID  = "1016425309209"
+FCM_APP_ID     = "1:1016425309209:android:a397210f6f94bc2d7f3688"
+FCM_PROJECT_ID = "moovair"
+FCM_API_KEY    = "AIzaSyA7HhxqQhZ5zfc1euu-HK6B3CZfAtNjrek"
+
 FAN_READ  = {30: "low", 60: "medium", 90: "high", 102: "auto"}
 FAN_WRITE = {"low": 30, "medium": 60, "high": 90, "auto": 102}
 MODE_WRITE = {"heat_cool": 1, "cool": 2, "dry": 3, "heat": 4,
@@ -79,6 +86,21 @@ def _aes_enc(text, sk):
 def _aes_dec(hex_data, sk):
     ct = bytes.fromhex(hex_data)
     return unpad(AES.new(sk.encode(), AES.MODE_ECB).decrypt(ct), 16).decode()
+
+def _fcm_decrypt_push(msg_hex, user_id):
+    """Déchiffre un message push FCM Moovair → retourne les bytes payload Midea."""
+    if not msg_hex:
+        return None
+    try:
+        key = hashlib.md5((user_id + APP_KEY).encode()).hexdigest()[:16].encode()
+        ct  = bytes.fromhex(msg_hex)
+        dec = unpad(AES.new(key, AES.MODE_ECB).decrypt(ct), 16).decode()
+        nums   = [int(x) for x in dec.split(',') if x.strip()]
+        m0b    = bytes([n & 0xFF for n in nums])
+        total  = struct.unpack('<H', m0b[4:6])[0]
+        return m0b[40:40 + (total - 56)]
+    except Exception:
+        return None
 
 
 # ── Client Cloud Moovair ──────────────────────────────────────────────────────
@@ -123,6 +145,7 @@ class MoovairCloud:
 
         self.session_id  = result["sessionId"]
         self.session_key = _aes_dec_session_key(result["accessToken"])
+        self.user_id     = result.get("userId", "")
         log.info("Login OK — sessionKey: %s…", self.session_key[:8])
 
     async def get_appliance_id(self):
@@ -213,21 +236,21 @@ class MoovairCloud:
 
 
 def _decode_state(payload):
-    indoor_f   = payload[16]
-    indoor_c   = round((indoor_f - 32) / 1.8, 1)
+    # payload[16] est une valeur fixe non représentative — température vient du FCM
     setpoint_c = (payload[22] - 50) / 2
     power      = payload[17]
     mode_byte  = payload[21]
     heat_pump  = payload[18] == 8
     fan_raw    = payload[23]
+    heating    = bool(payload[85]) if len(payload) > 85 else False
 
     if power == 0:
         hvac_mode = "off"
         action    = "off"
-    elif mode_byte == 1: hvac_mode = "heat_cool";  action = "heating" if payload[85] else "idle"
-    elif mode_byte == 2: hvac_mode = "cool";        action = "cooling" if payload[85] else "idle"
-    elif mode_byte == 3: hvac_mode = "dry";         action = "drying"  if payload[85] else "idle"
-    elif mode_byte == 4: hvac_mode = "heat";        action = "heating" if payload[85] else "idle"
+    elif mode_byte == 1: hvac_mode = "heat_cool";  action = "heating" if heating else "idle"
+    elif mode_byte == 2: hvac_mode = "cool";        action = "cooling" if heating else "idle"
+    elif mode_byte == 3: hvac_mode = "dry";         action = "drying"  if heating else "idle"
+    elif mode_byte == 4: hvac_mode = "heat";        action = "heating" if heating else "idle"
     elif mode_byte == 5: hvac_mode = "fan_only";    action = "fan"
     else:                hvac_mode = "off";         action = "off"
 
@@ -235,10 +258,10 @@ def _decode_state(payload):
         "hvac_mode":    hvac_mode,
         "action":       action,
         "aux_heat":     power == 1 and mode_byte == 4 and not heat_pump,
-        "current_temp": indoor_c,
+        "current_temp": None,   # sera mis à jour par le FCM listener
         "setpoint":     setpoint_c,
         "fan_mode":     FAN_READ.get(fan_raw, "auto"),
-        "heating":      bool(payload[85]),
+        "heating":      heating,
     }
 
 
@@ -255,6 +278,9 @@ class MoovairMQTTBridge:
         self._last_state  = {}
         self._running     = True
         self._loop        = None   # sera initialisé dans run()
+        self._fcm_temp    = None   # température ambiante reçue via FCM push
+        self._fcm_client  = None
+        self._user_id     = ""
 
     def _topic(self, suffix):
         return f"{CFG['mqtt_prefix']}/{self.appliance_id}/{suffix}"
@@ -314,14 +340,76 @@ class MoovairMQTTBridge:
 
         log.info("MQTT Discovery publiée (climate + aux_heat sensor)")
 
+    def _on_fcm_message(self, message, persistent_id, obj):
+        """Callback FCM — extrait la température ambiante du push Moovair."""
+        try:
+            parts = message.get('data', {}).get('message', '').split(';')
+            if len(parts) < 3:
+                return
+            msg_type = parts[0].lower()
+            if 'vital' not in msg_type and 'status' not in msg_type:
+                return
+            payload_json = json.loads(parts[2])
+            payload = _fcm_decrypt_push(payload_json.get('msg', ''), self._user_id)
+            if payload is None:
+                return
+            # Message 67 bytes : byte[37] = température ambiante en °C
+            if len(payload) == 67:
+                temp_c = payload[37]
+                if temp_c != self._fcm_temp:
+                    log.info("Température FCM mise à jour: %s°C", temp_c)
+                    self._fcm_temp = temp_c
+                    # Forcer re-publication si l'état existe déjà
+                    if self._last_state and self._loop:
+                        self._loop.call_soon_threadsafe(self._publish_fcm_temp)
+        except Exception as e:
+            log.debug("FCM message parse error: %s", e)
+
+    def _publish_fcm_temp(self):
+        """Publie uniquement la température FCM sur MQTT (appelé depuis le thread FCM)."""
+        if self._fcm_temp is not None and self.appliance_id:
+            self._mqtt.publish(self._topic("current_temperature"), str(self._fcm_temp))
+            log.debug("FCM temp publiée: %s°C", self._fcm_temp)
+
+    async def _start_fcm(self, session_id):
+        """Démarre le listener FCM pour recevoir la température ambiante en temps réel."""
+        try:
+            fcm_config = FcmRegisterConfig(
+                project_id=FCM_PROJECT_ID, app_id=FCM_APP_ID,
+                api_key=FCM_API_KEY, messaging_sender_id=FCM_SENDER_ID,
+            )
+            self._fcm_client = FcmPushClient(callback=self._on_fcm_message, fcm_config=fcm_config)
+            fcm_token = await self._fcm_client.checkin_or_register()
+
+            # Enregistrer le token FCM avec le cloud Midea
+            body = {"format": "2", "stamp": _ts(), "language": "en_US", "src": SRC,
+                    "sessionId": session_id, "pushToken": fcm_token, "pushType": "5"}
+            body["sign"] = _sign("/v1/user/push/token/update", body)
+            await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
+
+            await self._fcm_client.start()
+            log.info("FCM listener démarré — température ambiante live activée")
+        except Exception as e:
+            log.warning("FCM listener échec: %s", e)
+
     def _publish_state(self, state):
         """Publie l'état courant sur les topics MQTT."""
+        # Utiliser la température FCM si disponible
+        if self._fcm_temp is not None:
+            state = dict(state)
+            state["current_temp"] = self._fcm_temp
+
+        if state.get("current_temp") is None:
+            state = dict(state)
+            state.pop("current_temp", None)  # ne pas publier si on n'a pas encore de temp
+
         changed = state != self._last_state
         if not changed:
             return
 
         t = self._topic
-        self._mqtt.publish(t("current_temperature"), str(state["current_temp"]))
+        if state.get("current_temp") is not None:
+            self._mqtt.publish(t("current_temperature"), str(state["current_temp"]))
         self._mqtt.publish(t("target_temperature"),  str(state["setpoint"]))
         self._mqtt.publish(t("mode"),                state["hvac_mode"])
         self._mqtt.publish(t("fan_mode"),            state["fan_mode"])
@@ -442,6 +530,10 @@ class MoovairMQTTBridge:
         # Login cloud
         await self.cloud.login()
         self.appliance_id, self.device_info = await self.cloud.get_appliance_id()
+        self._user_id = self.cloud.user_id
+
+        # Démarrer le listener FCM (température ambiante live)
+        asyncio.ensure_future(self._start_fcm(self.cloud.session_id))
 
         # Connexion MQTT
         self._mqtt.on_connect    = self._on_mqtt_connect
@@ -491,6 +583,8 @@ class MoovairMQTTBridge:
 
         # Arrêt propre
         log.info("Arrêt du bridge...")
+        if self._fcm_client:
+            await self._fcm_client.stop()
         self._mqtt.publish(self._topic("availability"), "offline")
         self._mqtt.loop_stop()
         self._mqtt.disconnect()
