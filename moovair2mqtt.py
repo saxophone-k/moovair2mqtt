@@ -58,10 +58,12 @@ APPLIANCE_ID = None   # découvert au login
 DEVICE_SN    = "bridge"
 
 # ── Firebase Cloud Messaging (température ambiante via push) ──────────────────
-FCM_SENDER_ID  = "1016425309209"
-FCM_APP_ID     = "1:1016425309209:android:a397210f6f94bc2d7f3688"
-FCM_PROJECT_ID = "moovair"
-FCM_API_KEY    = "AIzaSyA7HhxqQhZ5zfc1euu-HK6B3CZfAtNjrek"
+FCM_SENDER_ID   = "1016425309209"
+FCM_APP_ID      = "1:1016425309209:android:a397210f6f94bc2d7f3688"
+FCM_PROJECT_ID  = "moovair"
+FCM_API_KEY     = "AIzaSyA7HhxqQhZ5zfc1euu-HK6B3CZfAtNjrek"
+FCM_MAX_SILENCE = 600   # secondes sans push → force reconnexion
+FCM_TEMP_MAX_AGE = 900  # secondes : ne pas publier une temp plus vieille que ça
 
 FAN_READ  = {30: "low", 60: "medium", 90: "high", 102: "auto"}
 FAN_WRITE = {"low": 30, "medium": 60, "high": 90, "auto": 102}
@@ -279,6 +281,8 @@ class MoovairMQTTBridge:
         self._running     = True
         self._loop        = None   # sera initialisé dans run()
         self._fcm_temp    = None   # température ambiante reçue via FCM push
+        self._fcm_temp_ts = None   # monotonic timestamp de la dernière mise à jour FCM
+        self._fcm_creds   = None   # credentials FCM persistés entre reconnexions
         self._fcm_client  = None
         self._user_id     = ""
 
@@ -340,6 +344,9 @@ class MoovairMQTTBridge:
 
         log.info("MQTT Discovery publiée (climate + aux_heat sensor)")
 
+    def _on_fcm_credentials_updated(self, creds):
+        self._fcm_creds = creds
+
     def _on_fcm_message(self, message, persistent_id, obj):
         """Callback FCM — extrait la température ambiante du push Moovair."""
         try:
@@ -356,6 +363,9 @@ class MoovairMQTTBridge:
             # Message 67 bytes : byte[37] = température ambiante en °C
             if len(payload) == 67:
                 temp_c = payload[37]
+                log.debug("FCM payload bytes[35:42]: %s", list(payload[35:42]))
+                # Toujours mettre à jour le timestamp — confirme que FCM est vivant
+                self._fcm_temp_ts = time.monotonic()
                 if temp_c != self._fcm_temp:
                     log.info("Température FCM mise à jour: %s°C", temp_c)
                     self._fcm_temp = temp_c
@@ -371,31 +381,57 @@ class MoovairMQTTBridge:
             self._mqtt.publish(self._topic("current_temperature"), str(self._fcm_temp))
             log.debug("FCM temp publiée: %s°C", self._fcm_temp)
 
-    async def _start_fcm(self, session_id):
-        """Démarre le listener FCM pour recevoir la température ambiante en temps réel."""
-        try:
-            fcm_config = FcmRegisterConfig(
-                project_id=FCM_PROJECT_ID, app_id=FCM_APP_ID,
-                api_key=FCM_API_KEY, messaging_sender_id=FCM_SENDER_ID,
-            )
-            self._fcm_client = FcmPushClient(callback=self._on_fcm_message, fcm_config=fcm_config)
-            fcm_token = await self._fcm_client.checkin_or_register()
+    async def _fcm_loop(self, session_id):
+        """Boucle FCM — démarre le listener et reconnecte automatiquement en cas de coupure."""
+        retry_delay = 30
+        while self._running:
+            try:
+                fcm_config = FcmRegisterConfig(
+                    project_id=FCM_PROJECT_ID, app_id=FCM_APP_ID,
+                    api_key=FCM_API_KEY, messaging_sender_id=FCM_SENDER_ID,
+                )
+                self._fcm_client = FcmPushClient(
+                    callback=self._on_fcm_message,
+                    fcm_config=fcm_config,
+                    credentials=self._fcm_creds,
+                    credentials_updated_callback=self._on_fcm_credentials_updated,
+                )
+                fcm_token = await self._fcm_client.checkin_or_register()
 
-            # Enregistrer le token FCM avec le cloud Midea
-            body = {"format": "2", "stamp": _ts(), "language": "en_US", "src": SRC,
-                    "sessionId": session_id, "pushToken": fcm_token, "pushType": "5"}
-            body["sign"] = _sign("/v1/user/push/token/update", body)
-            await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
+                body = {"format": "2", "stamp": _ts(), "language": "en_US", "src": SRC,
+                        "sessionId": session_id, "pushToken": fcm_token, "pushType": "5"}
+                body["sign"] = _sign("/v1/user/push/token/update", body)
+                await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
 
-            await self._fcm_client.start()
-            log.info("FCM listener démarré — température ambiante live activée")
-        except Exception as e:
-            log.warning("FCM listener échec: %s", e)
+                await self._fcm_client.start()
+                log.info("FCM listener démarré — température ambiante live activée")
+                retry_delay = 30  # reset le backoff après un démarrage réussi
+
+                # Surveiller la connexion FCM jusqu'à ce qu'elle tombe
+                while self._running:
+                    await asyncio.sleep(60)
+                    if not self._fcm_client.is_started():
+                        log.warning("FCM client arrêté, reconnexion...")
+                        break
+                    if (self._fcm_temp_ts is not None and
+                            time.monotonic() - self._fcm_temp_ts > FCM_MAX_SILENCE):
+                        log.warning("Pas de push FCM depuis >%ds, reconnexion...", FCM_MAX_SILENCE)
+                        await self._fcm_client.stop()
+                        break
+
+            except Exception as e:
+                log.warning("FCM échec (%s), retry dans %ds", e, retry_delay)
+
+            if not self._running:
+                break
+            await asyncio.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 300)  # backoff exponentiel, max 5 min
 
     def _publish_state(self, state):
         """Publie l'état courant sur les topics MQTT."""
-        # Utiliser la température FCM si disponible
-        if self._fcm_temp is not None:
+        # Utiliser la température FCM si disponible et fraîche
+        if (self._fcm_temp is not None and self._fcm_temp_ts is not None and
+                time.monotonic() - self._fcm_temp_ts < FCM_TEMP_MAX_AGE):
             state = dict(state)
             state["current_temp"] = self._fcm_temp
 
@@ -532,8 +568,8 @@ class MoovairMQTTBridge:
         self.appliance_id, self.device_info = await self.cloud.get_appliance_id()
         self._user_id = self.cloud.user_id
 
-        # Démarrer le listener FCM (température ambiante live)
-        asyncio.ensure_future(self._start_fcm(self.cloud.session_id))
+        # Démarrer la boucle FCM (température ambiante live, reconnexion automatique)
+        asyncio.ensure_future(self._fcm_loop(self.cloud.session_id))
 
         # Connexion MQTT
         self._mqtt.on_connect    = self._on_mqtt_connect
