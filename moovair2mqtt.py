@@ -519,7 +519,15 @@ class MoovairMQTTBridge:
         # Statut FCM
         self._mqtt.publish(t("diag/fcm_connected"), "ON")
 
-    async def _fcm_loop(self, session_id):
+    async def _fcm_register_token(self, fcm_token):
+        """Enregistre le token FCM auprès du cloud Moovair (utilise la session courante)."""
+        body = {"format": "2", "stamp": _ts(), "language": "en_US", "src": SRC,
+                "sessionId": self.cloud.session_id, "pushToken": fcm_token, "pushType": "5"}
+        body["sign"] = _sign("/v1/user/push/token/update", body)
+        await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
+        log.debug("FCM token enregistré avec session %s…", self.cloud.session_id[:8])
+
+    async def _fcm_loop(self):
         """Boucle FCM — démarre le listener et reconnecte automatiquement en cas de coupure."""
         retry_delay = 30
         while self._running:
@@ -535,11 +543,7 @@ class MoovairMQTTBridge:
                     credentials_updated_callback=self._on_fcm_credentials_updated,
                 )
                 fcm_token = await self._fcm_client.checkin_or_register()
-
-                body = {"format": "2", "stamp": _ts(), "language": "en_US", "src": SRC,
-                        "sessionId": session_id, "pushToken": fcm_token, "pushType": "5"}
-                body["sign"] = _sign("/v1/user/push/token/update", body)
-                await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
+                await self._fcm_register_token(fcm_token)
 
                 await self._fcm_client.start()
                 log.info("FCM listener démarré — température ambiante live activée")
@@ -711,6 +715,14 @@ class MoovairMQTTBridge:
         log.info("Re-login en cours...")
         try:
             await self.cloud.login()
+            # Re-enregistrer le token FCM avec la nouvelle session
+            if self._fcm_client is not None:
+                try:
+                    fcm_token = await self._fcm_client.checkin_or_register()
+                    await self._fcm_register_token(fcm_token)
+                    log.info("FCM token re-enregistré après re-login")
+                except Exception as fe:
+                    log.warning("Re-enregistrement FCM échoué: %s", fe)
         except Exception as e:
             log.error("Re-login échoué: %s", e)
             self._mqtt.publish(self._topic("availability"), "offline")
@@ -726,7 +738,7 @@ class MoovairMQTTBridge:
         self._user_id = self.cloud.user_id
 
         # Démarrer la boucle FCM (température ambiante live, reconnexion automatique)
-        asyncio.ensure_future(self._fcm_loop(self.cloud.session_id))
+        asyncio.ensure_future(self._fcm_loop())
 
         # Connexion MQTT
         self._mqtt.on_connect    = self._on_mqtt_connect
