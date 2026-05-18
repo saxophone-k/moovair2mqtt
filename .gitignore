@@ -6,3 +6,7 @@ __pycache__/
 test_auth.py
 control.py
 read_state.py
+moovair2mqttbeta.py
+test_json_api.py
+ENTITIES_DISCOVERED.md
+fcm_listen.py

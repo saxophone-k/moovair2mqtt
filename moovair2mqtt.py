@@ -279,12 +279,20 @@ class MoovairMQTTBridge:
         self._cmd_queue   = asyncio.Queue()
         self._last_state  = {}
         self._running     = True
-        self._loop        = None   # sera initialisé dans run()
-        self._fcm_temp    = None   # température ambiante reçue via FCM push
-        self._fcm_temp_ts = None   # monotonic timestamp de la dernière mise à jour FCM
-        self._fcm_creds   = None   # credentials FCM persistés entre reconnexions
-        self._fcm_client  = None
-        self._user_id     = ""
+        self._loop        = None
+        # ── Données FCM ──────────────────────────────────────────────────────
+        self._fcm_temp         = None   # indoor temp entière (°C, FCM 67-byte[37])
+        self._fcm_temp_precise = None   # indoor temp 0.5°C (FCM 88-byte A1[30]) — à confirmer
+        self._fcm_outdoor_temp = None   # outdoor temp (FCM 88-byte A1[31]) — à confirmer
+        self._fcm_humidity     = None   # indoor humidity % (FCM 67-byte[36]) — à confirmer
+        self._fcm_temp_ts      = None   # monotonic timestamp dernière mise à jour FCM
+        self._fcm_creds        = None
+        self._fcm_client       = None
+        self._user_id          = ""
+        # ── Diagnostics bridge ────────────────────────────────────────────────
+        self._diag_last_update    = None  # timestamp ISO dernière poll réussie
+        self._diag_last_error     = ""    # texte dernière erreur
+        self._diag_consecutive_errors = 0
 
     def _topic(self, suffix):
         return f"{CFG['mqtt_prefix']}/{self.appliance_id}/{suffix}"
@@ -327,9 +335,9 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("climate"),
             json.dumps(climate), retain=True)
 
-        # ── Sensor Aux Heat (élément résistif 10kW) ─────────────────────
+        # ── Sensor Aux Heat (résistif 10kW) ────────────────────────────
         aux_heat = {
-            "name":           "Moovair Aux-Heat",
+            "name":           "Moovair Aux Heat",
             "unique_id":      f"moovair_{self.appliance_id}_aux_heat",
             "device":         dev,
             "state_topic":    self._topic("aux_heat"),
@@ -342,13 +350,102 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("binary_sensor", "aux_heat/config"),
             json.dumps(aux_heat), retain=True)
 
-        log.info("MQTT Discovery publiée (climate + aux_heat sensor)")
+        # ── Indoor Humidity sensor ───────────────────────────────────────
+        humidity = {
+            "name":                 "Moovair Indoor Humidity",
+            "unique_id":            f"moovair_{self.appliance_id}_indoor_humidity",
+            "device":               dev,
+            "state_topic":          self._topic("indoor_humidity"),
+            "unit_of_measurement":  "%",
+            "device_class":         "humidity",
+            "state_class":          "measurement",
+            "icon":                 "mdi:water-percent",
+            "availability_topic":   self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "indoor_humidity/config"),
+            json.dumps(humidity), retain=True)
+
+        # ── Outdoor Temperature sensor ───────────────────────────────────
+        outdoor_temp = {
+            "name":                 "Moovair Outdoor Temperature",
+            "unique_id":            f"moovair_{self.appliance_id}_outdoor_temp",
+            "device":               dev,
+            "state_topic":          self._topic("outdoor_temperature"),
+            "unit_of_measurement":  "°C",
+            "device_class":         "temperature",
+            "state_class":          "measurement",
+            "icon":                 "mdi:thermometer-low",
+            "availability_topic":   self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "outdoor_temperature/config"),
+            json.dumps(outdoor_temp), retain=True)
+
+        # ── Diagnostics bridge ───────────────────────────────────────────
+        last_update = {
+            "name":         "Moovair Last Update",
+            "unique_id":    f"moovair_{self.appliance_id}_last_update",
+            "device":       dev,
+            "state_topic":  self._topic("diag/last_update"),
+            "device_class": "timestamp",
+            "icon":         "mdi:clock-check",
+            "entity_category": "diagnostic",
+            "availability_topic": self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "last_update/config"),
+            json.dumps(last_update), retain=True)
+
+        last_error = {
+            "name":         "Moovair Last Error",
+            "unique_id":    f"moovair_{self.appliance_id}_last_error",
+            "device":       dev,
+            "state_topic":  self._topic("diag/last_error"),
+            "icon":         "mdi:alert-circle-outline",
+            "entity_category": "diagnostic",
+            "availability_topic": self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "last_error/config"),
+            json.dumps(last_error), retain=True)
+
+        consecutive_errors = {
+            "name":                 "Moovair Consecutive Errors",
+            "unique_id":            f"moovair_{self.appliance_id}_consecutive_errors",
+            "device":               dev,
+            "state_topic":          self._topic("diag/consecutive_errors"),
+            "state_class":          "measurement",
+            "icon":                 "mdi:counter",
+            "entity_category":      "diagnostic",
+            "availability_topic":   self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "consecutive_errors/config"),
+            json.dumps(consecutive_errors), retain=True)
+
+        fcm_connected = {
+            "name":         "Moovair FCM Connected",
+            "unique_id":    f"moovair_{self.appliance_id}_fcm_connected",
+            "device":       dev,
+            "state_topic":  self._topic("diag/fcm_connected"),
+            "payload_on":   "ON",
+            "payload_off":  "OFF",
+            "icon":         "mdi:cloud-check",
+            "entity_category": "diagnostic",
+            "availability_topic": self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("binary_sensor", "fcm_connected/config"),
+            json.dumps(fcm_connected), retain=True)
+
+        log.info("MQTT Discovery publiée (climate + %d sensors)", 8)
 
     def _on_fcm_credentials_updated(self, creds):
         self._fcm_creds = creds
 
     def _on_fcm_message(self, message, persistent_id, obj):
-        """Callback FCM — extrait la température ambiante du push Moovair."""
+        """Callback FCM — extrait température, humidité, outdoor temp des pushes Moovair."""
         try:
             parts = message.get('data', {}).get('message', '').split(';')
             if len(parts) < 3:
@@ -360,26 +457,67 @@ class MoovairMQTTBridge:
             payload = _fcm_decrypt_push(payload_json.get('msg', ''), self._user_id)
             if payload is None:
                 return
-            # Message 67 bytes : byte[37] = température ambiante en °C
+
+            self._fcm_temp_ts = time.monotonic()
+            changed = False
+
+            # ── Payload 67 bytes (status condensé, toutes les ~11s) ──────────
+            # byte[37] = indoor temp entière (°C) — confirmé en prod
+            # byte[36] = indoor humidity (%) — à confirmer par l'utilisateur
             if len(payload) == 67:
                 temp_c = payload[37]
-                log.debug("FCM payload bytes[35:42]: %s", list(payload[35:42]))
-                # Toujours mettre à jour le timestamp — confirme que FCM est vivant
-                self._fcm_temp_ts = time.monotonic()
                 if temp_c != self._fcm_temp:
-                    log.info("Température FCM mise à jour: %s°C", temp_c)
+                    log.info("FCM indoor temp: %s°C", temp_c)
                     self._fcm_temp = temp_c
-                    # Forcer re-publication si l'état existe déjà
-                    if self._last_state and self._loop:
-                        self._loop.call_soon_threadsafe(self._publish_fcm_temp)
+                    changed = True
+
+                humidity = payload[36]
+                if humidity != self._fcm_humidity and 0 < humidity <= 100:
+                    log.info("FCM indoor humidity: %s%%", humidity)
+                    self._fcm_humidity = humidity
+                    changed = True
+
+            # ── Payload 88 bytes, sous-type A1 (byte[17]==161) ───────────────
+            # byte[30] = indoor temp haute précision (formule (byte-50)/2 → 0.5°C)
+            # byte[31] = outdoor temp (même formule)
+            # — À CONFIRMER par l'utilisateur via HA
+            elif len(payload) == 88 and payload[17] == 161:
+                raw_indoor  = payload[30] if len(payload) > 30 else 0
+                raw_outdoor = payload[31] if len(payload) > 31 else 0
+                if raw_indoor > 0:
+                    temp_precise = (raw_indoor - 50) / 2.0
+                    if temp_precise != self._fcm_temp_precise and -20 < temp_precise < 60:
+                        log.info("FCM indoor temp precise: %.1f°C (raw=%d)", temp_precise, raw_indoor)
+                        self._fcm_temp_precise = temp_precise
+                        changed = True
+                if raw_outdoor > 0:
+                    temp_out = (raw_outdoor - 50) / 2.0
+                    if temp_out != self._fcm_outdoor_temp and -40 < temp_out < 60:
+                        log.info("FCM outdoor temp: %.1f°C (raw=%d)", temp_out, raw_outdoor)
+                        self._fcm_outdoor_temp = temp_out
+                        changed = True
+
+            if changed and self._last_state and self._loop:
+                self._loop.call_soon_threadsafe(self._publish_fcm_sensors)
+
         except Exception as e:
             log.debug("FCM message parse error: %s", e)
 
-    def _publish_fcm_temp(self):
-        """Publie uniquement la température FCM sur MQTT (appelé depuis le thread FCM)."""
-        if self._fcm_temp is not None and self.appliance_id:
-            self._mqtt.publish(self._topic("current_temperature"), str(self._fcm_temp))
-            log.debug("FCM temp publiée: %s°C", self._fcm_temp)
+    def _publish_fcm_sensors(self):
+        """Publie les données FCM sur MQTT (appelé depuis le thread FCM)."""
+        if not self.appliance_id:
+            return
+        t = self._topic
+        # Température : utiliser la précision 0.5°C si disponible, sinon entière
+        temp_to_publish = self._fcm_temp_precise if self._fcm_temp_precise is not None else self._fcm_temp
+        if temp_to_publish is not None:
+            self._mqtt.publish(t("current_temperature"), str(temp_to_publish))
+        if self._fcm_humidity is not None:
+            self._mqtt.publish(t("indoor_humidity"), str(self._fcm_humidity))
+        if self._fcm_outdoor_temp is not None:
+            self._mqtt.publish(t("outdoor_temperature"), str(self._fcm_outdoor_temp))
+        # Statut FCM
+        self._mqtt.publish(t("diag/fcm_connected"), "ON")
 
     async def _fcm_loop(self, session_id):
         """Boucle FCM — démarre le listener et reconnecte automatiquement en cas de coupure."""
@@ -429,15 +567,18 @@ class MoovairMQTTBridge:
 
     def _publish_state(self, state):
         """Publie l'état courant sur les topics MQTT."""
-        # Utiliser la température FCM si disponible et fraîche
-        if (self._fcm_temp is not None and self._fcm_temp_ts is not None and
-                time.monotonic() - self._fcm_temp_ts < FCM_TEMP_MAX_AGE):
+        # Température : priorité à la précision 0.5°C (A1), fallback entière (67-byte)
+        fcm_fresh = (self._fcm_temp_ts is not None and
+                     time.monotonic() - self._fcm_temp_ts < FCM_TEMP_MAX_AGE)
+        if fcm_fresh:
             state = dict(state)
-            state["current_temp"] = self._fcm_temp
+            temp = self._fcm_temp_precise if self._fcm_temp_precise is not None else self._fcm_temp
+            if temp is not None:
+                state["current_temp"] = temp
 
         if state.get("current_temp") is None:
             state = dict(state)
-            state.pop("current_temp", None)  # ne pas publier si on n'a pas encore de temp
+            state.pop("current_temp", None)
 
         changed = state != self._last_state
         if not changed:
@@ -452,6 +593,22 @@ class MoovairMQTTBridge:
         self._mqtt.publish(t("action"),              state["action"])
         self._mqtt.publish(t("aux_heat"),            "ON" if state["aux_heat"] else "OFF")
         self._mqtt.publish(t("availability"),        "online")
+
+        # Diagnostics bridge
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._mqtt.publish(t("diag/last_update"),          now_iso)
+        self._mqtt.publish(t("diag/consecutive_errors"),   str(self._diag_consecutive_errors))
+        fcm_ok = fcm_fresh and (self._fcm_client is not None and self._fcm_client.is_started())
+        self._mqtt.publish(t("diag/fcm_connected"),        "ON" if fcm_ok else "OFF")
+        if self._diag_last_error:
+            self._mqtt.publish(t("diag/last_error"),       self._diag_last_error)
+
+        # Sensors FCM (si disponibles)
+        if fcm_fresh:
+            if self._fcm_humidity is not None:
+                self._mqtt.publish(t("indoor_humidity"),   str(self._fcm_humidity))
+            if self._fcm_outdoor_temp is not None:
+                self._mqtt.publish(t("outdoor_temperature"), str(self._fcm_outdoor_temp))
 
         if self._last_state:
             changes = {k: v for k, v in state.items() if v != self._last_state.get(k)}
@@ -588,14 +745,13 @@ class MoovairMQTTBridge:
         log.info("Bridge démarré — poll toutes les %ss", CFG["poll_interval"])
         poll_interval = CFG["poll_interval"]
         last_poll     = 0
-        consecutive_errors = 0
 
         while self._running:
             # Traiter les commandes en attente
             while not self._cmd_queue.empty():
                 cmd = await self._cmd_queue.get()
                 await self._handle_command(cmd)
-                last_poll = 0  # Forcer re-poll après commande
+                last_poll = 0
 
             # Poll périodique
             now = time.monotonic()
@@ -604,16 +760,20 @@ class MoovairMQTTBridge:
                     state = await self.cloud.read_state(self.appliance_id)
                     self._publish_state(state)
                     self._mqtt.publish(self._topic("availability"), "online", retain=True)
-                    consecutive_errors = 0
+                    self._diag_consecutive_errors = 0
                     last_poll = now
                 except Exception as e:
-                    consecutive_errors += 1
-                    log.error("Erreur lecture état (%s/3): %s", consecutive_errors, e)
-                    last_poll = now  # éviter de spam en boucle
-                    if consecutive_errors >= 3:
+                    self._diag_consecutive_errors += 1
+                    self._diag_last_error = str(e)[:200]
+                    log.error("Erreur lecture état (%s/3): %s", self._diag_consecutive_errors, e)
+                    last_poll = now
+                    self._mqtt.publish(self._topic("diag/consecutive_errors"),
+                                       str(self._diag_consecutive_errors))
+                    self._mqtt.publish(self._topic("diag/last_error"), self._diag_last_error)
+                    if self._diag_consecutive_errors >= 3:
                         log.warning("3 erreurs consécutives — re-login...")
                         await self._relogin()
-                        consecutive_errors = 0
+                        self._diag_consecutive_errors = 0
 
             await asyncio.sleep(1)
 
