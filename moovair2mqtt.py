@@ -649,7 +649,7 @@ class MoovairMQTTBridge:
         self._last_state = state.copy()
 
         # Dry mode : disponibilité selon le mode HVAC courant
-        dry_ok = hvac_mode in DRY_MODE_REQUIRES
+        dry_ok = state["hvac_mode"] in DRY_MODE_REQUIRES
         self._mqtt.publish(self._topic("dry_mode_available"),
                            "online" if dry_ok else "offline")
         if not dry_ok and self._dry_mode != "off":
