@@ -335,9 +335,9 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("climate"),
             json.dumps(climate), retain=True)
 
-        # ── Sensor Aux Heat (résistif 10kW) ────────────────────────────
+        # ── Aux Heat (résistif 10kW) ─────────────────────────────────────
         aux_heat = {
-            "name":           "Moovair Aux Heat",
+            "name":           "Aux Heat",
             "unique_id":      f"moovair_{self.appliance_id}_aux_heat",
             "device":         dev,
             "state_topic":    self._topic("aux_heat"),
@@ -350,9 +350,9 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("binary_sensor", "aux_heat/config"),
             json.dumps(aux_heat), retain=True)
 
-        # ── Indoor Humidity sensor ───────────────────────────────────────
+        # ── Indoor Humidity ──────────────────────────────────────────────
         humidity = {
-            "name":                 "Moovair Indoor Humidity",
+            "name":                 "Indoor Humidity",
             "unique_id":            f"moovair_{self.appliance_id}_indoor_humidity",
             "device":               dev,
             "state_topic":          self._topic("indoor_humidity"),
@@ -366,93 +366,34 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("sensor", "indoor_humidity/config"),
             json.dumps(humidity), retain=True)
 
-        # ── Outdoor Temperature sensor ───────────────────────────────────
+        # ── Heat Pump Coil Temperature (T4, unité extérieure) ────────────
         outdoor_temp = {
-            "name":                 "Moovair Outdoor Temperature",
+            "name":                 "Heat Pump Coil Temperature",
             "unique_id":            f"moovair_{self.appliance_id}_outdoor_temp",
             "device":               dev,
             "state_topic":          self._topic("outdoor_temperature"),
             "unit_of_measurement":  "°C",
             "device_class":         "temperature",
             "state_class":          "measurement",
-            "icon":                 "mdi:thermometer-low",
+            "icon":                 "mdi:heat-pump",
             "availability_topic":   self._topic("availability"),
         }
         self._mqtt.publish(
             self._ha_discovery_topic("sensor", "outdoor_temperature/config"),
             json.dumps(outdoor_temp), retain=True)
 
-        # ── Diagnostics bridge ───────────────────────────────────────────
-        last_update = {
-            "name":         "Moovair Last Update",
-            "unique_id":    f"moovair_{self.appliance_id}_last_update",
-            "device":       dev,
-            "state_topic":  self._topic("diag/last_update"),
-            "device_class": "timestamp",
-            "icon":         "mdi:clock-check",
-            "entity_category": "diagnostic",
-            "availability_topic": self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "last_update/config"),
-            json.dumps(last_update), retain=True)
-
-        last_error = {
-            "name":         "Moovair Last Error",
-            "unique_id":    f"moovair_{self.appliance_id}_last_error",
-            "device":       dev,
-            "state_topic":  self._topic("diag/last_error"),
-            "icon":         "mdi:alert-circle-outline",
-            "entity_category": "diagnostic",
-            "availability_topic": self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "last_error/config"),
-            json.dumps(last_error), retain=True)
-
-        consecutive_errors = {
-            "name":                 "Moovair Consecutive Errors",
-            "unique_id":            f"moovair_{self.appliance_id}_consecutive_errors",
-            "device":               dev,
-            "state_topic":          self._topic("diag/consecutive_errors"),
-            "state_class":          "measurement",
-            "icon":                 "mdi:counter",
-            "entity_category":      "diagnostic",
-            "availability_topic":   self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "consecutive_errors/config"),
-            json.dumps(consecutive_errors), retain=True)
-
-        fcm_connected = {
-            "name":         "Moovair FCM Connected",
-            "unique_id":    f"moovair_{self.appliance_id}_fcm_connected",
-            "device":       dev,
-            "state_topic":  self._topic("diag/fcm_connected"),
-            "payload_on":   "ON",
-            "payload_off":  "OFF",
-            "icon":         "mdi:cloud-check",
-            "entity_category": "diagnostic",
-            "availability_topic": self._topic("availability"),
-        }
+        # ── Suppression des anciens sensors de diagnostic de HA ─────────────
+        # Payload vide = supprime l'entité dans HA (si elle existait)
+        for old in ("last_update/config", "last_error/config",
+                    "consecutive_errors/config", "fcm_status/config"):
+            self._mqtt.publish(
+                self._ha_discovery_topic("sensor", old), "", retain=True)
         self._mqtt.publish(
             self._ha_discovery_topic("binary_sensor", "fcm_connected/config"),
-            json.dumps(fcm_connected), retain=True)
-
-        fcm_status = {
-            "name":         "Moovair FCM Status",
-            "unique_id":    f"moovair_{self.appliance_id}_fcm_status",
-            "device":       dev,
-            "state_topic":  self._topic("diag/fcm_status"),
-            "icon":         "mdi:cloud-refresh",
-            "entity_category": "diagnostic",
-            "availability_topic": self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "fcm_status/config"),
-            json.dumps(fcm_status), retain=True)
-
-        log.info("MQTT Discovery publiée (climate + sensors)")
+            "", retain=True)
+        # Note: les diagnostics sont toujours publiés sur diag/* (MQTT brut)
+        # pour les développeurs, mais sans entités HA visibles.
+        log.info("MQTT Discovery publiée (climate + aux_heat + humidity + coil temp)")
 
     def _on_fcm_credentials_updated(self, creds):
         self._fcm_creds = creds
