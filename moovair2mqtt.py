@@ -439,7 +439,20 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("binary_sensor", "fcm_connected/config"),
             json.dumps(fcm_connected), retain=True)
 
-        log.info("MQTT Discovery publiée (climate + %d sensors)", 8)
+        fcm_status = {
+            "name":         "Moovair FCM Status",
+            "unique_id":    f"moovair_{self.appliance_id}_fcm_status",
+            "device":       dev,
+            "state_topic":  self._topic("diag/fcm_status"),
+            "icon":         "mdi:cloud-refresh",
+            "entity_category": "diagnostic",
+            "availability_topic": self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "fcm_status/config"),
+            json.dumps(fcm_status), retain=True)
+
+        log.info("MQTT Discovery publiée (climate + sensors)")
 
     def _on_fcm_credentials_updated(self, creds):
         self._fcm_creds = creds
@@ -459,6 +472,10 @@ class MoovairMQTTBridge:
                 return
 
             self._fcm_temp_ts = time.monotonic()
+            # Publier un accusé de réception FCM visible dans HA
+            if self.appliance_id:
+                self._mqtt.publish(self._topic("diag/fcm_status"),
+                                   f"message_received len={len(payload)}")
             changed = False
 
             # ── Payload 67 bytes (status condensé, toutes les ~11s) ──────────
@@ -527,11 +544,20 @@ class MoovairMQTTBridge:
         await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
         log.debug("FCM token enregistré avec session %s…", self.cloud.session_id[:8])
 
+    def _fcm_pub_status(self, status: str):
+        """Publie le statut FCM sur MQTT pour diagnostic sans log."""
+        if self.appliance_id:
+            self._mqtt.publish(self._topic("diag/fcm_status"), status)
+            log.info("FCM status: %s", status)
+
     async def _fcm_loop(self):
         """Boucle FCM — démarre le listener et reconnecte automatiquement en cas de coupure."""
         retry_delay = 30
+        attempt = 0
         while self._running:
+            attempt += 1
             try:
+                self._fcm_pub_status(f"connecting (attempt {attempt})")
                 fcm_config = FcmRegisterConfig(
                     project_id=FCM_PROJECT_ID, app_id=FCM_APP_ID,
                     api_key=FCM_API_KEY, messaging_sender_id=FCM_SENDER_ID,
@@ -543,31 +569,38 @@ class MoovairMQTTBridge:
                     credentials_updated_callback=self._on_fcm_credentials_updated,
                 )
                 fcm_token = await self._fcm_client.checkin_or_register()
+                self._fcm_pub_status("token_obtained")
                 await self._fcm_register_token(fcm_token)
+                self._fcm_pub_status("token_registered")
 
                 await self._fcm_client.start()
+                self._fcm_pub_status("listening")
                 log.info("FCM listener démarré — température ambiante live activée")
-                retry_delay = 30  # reset le backoff après un démarrage réussi
+                retry_delay = 30
 
                 # Surveiller la connexion FCM jusqu'à ce qu'elle tombe
                 while self._running:
                     await asyncio.sleep(60)
                     if not self._fcm_client.is_started():
+                        self._fcm_pub_status("dropped — reconnecting")
                         log.warning("FCM client arrêté, reconnexion...")
                         break
                     if (self._fcm_temp_ts is not None and
                             time.monotonic() - self._fcm_temp_ts > FCM_MAX_SILENCE):
+                        self._fcm_pub_status(f"silent >{FCM_MAX_SILENCE}s — reconnecting")
                         log.warning("Pas de push FCM depuis >%ds, reconnexion...", FCM_MAX_SILENCE)
                         await self._fcm_client.stop()
                         break
 
             except Exception as e:
+                msg = str(e)[:120]
+                self._fcm_pub_status(f"error: {msg}")
                 log.warning("FCM échec (%s), retry dans %ds", e, retry_delay)
 
             if not self._running:
                 break
             await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 300)  # backoff exponentiel, max 5 min
+            retry_delay = min(retry_delay * 2, 300)
 
     def _publish_state(self, state):
         """Publie l'état courant sur les topics MQTT."""
