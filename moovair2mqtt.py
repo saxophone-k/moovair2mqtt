@@ -249,18 +249,21 @@ def _decode_state(payload):
     if power == 0:
         hvac_mode = "off"
         action    = "off"
-    elif mode_byte == 1: hvac_mode = "heat_cool";  action = "heating" if heating else "idle"
-    elif mode_byte == 2: hvac_mode = "cool";        action = "cooling" if heating else "idle"
-    elif mode_byte == 3: hvac_mode = "dry";         action = "drying"  if heating else "idle"
-    elif mode_byte == 4: hvac_mode = "heat";        action = "heating" if heating else "idle"
-    elif mode_byte == 5: hvac_mode = "fan_only";    action = "fan"
-    else:                hvac_mode = "off";         action = "off"
+    elif mode_byte == 1: hvac_mode = "heat_cool";      action = "heating" if heating else "idle"
+    elif mode_byte == 2: hvac_mode = "cool";            action = "cooling" if heating else "idle"
+    elif mode_byte == 3: hvac_mode = "cool";            action = "cooling" if heating else "idle"
+    elif mode_byte == 4 and heat_pump:
+                         hvac_mode = "heat";            action = "heating" if heating else "idle"
+    elif mode_byte == 4 and not heat_pump:
+                         hvac_mode = "emergency_heat";  action = "heating" if heating else "idle"
+    elif mode_byte == 5: hvac_mode = "fan_only";        action = "fan"
+    else:                hvac_mode = "off";             action = "off"
 
     return {
         "hvac_mode":    hvac_mode,
         "action":       action,
-        "aux_heat":     power == 1 and mode_byte == 4 and not heat_pump,
-        "current_temp": None,   # sera mis à jour par le FCM listener
+        "aux_heat":     hvac_mode == "emergency_heat" and heating,
+        "current_temp": None,
         "setpoint":     setpoint_c,
         "fan_mode":     FAN_READ.get(fan_raw, "auto"),
         "heating":      heating,
@@ -315,7 +318,7 @@ class MoovairMQTTBridge:
             "name":                         "Moovair",
             "unique_id":                    f"moovair_{self.appliance_id}",
             "device":                       dev,
-            "modes":                        ["off", "heat", "cool", "heat_cool", "fan_only", "dry"],
+            "modes":                        ["off", "heat_cool", "heat", "cool", "fan_only", "emergency_heat"],
             "fan_modes":                    ["auto", "low", "medium", "high"],
             "current_temperature_topic":    self._topic("current_temperature"),
             "temperature_state_topic":      self._topic("target_temperature"),
