@@ -179,8 +179,8 @@ This bridge communicates with the Moovair cloud (Midea NetHomePlus infrastructur
 
 ### Emergency Heat vs. Heat
 
-- **Heat mode:** Uses the heat pump. The 10kW electric element supplements automatically at very low outdoor temperatures (below the system's balance point, typically -10°C to -15°C). Automatic detection of supplemental PTC in this mode requires winter testing — not yet implemented.
-- **Emergency Heat:** Bypasses the heat pump entirely. Only the 10kW electric element runs. Use only if the heat pump is broken. A warning is displayed on the thermostat.
+- **Heat mode:** Uses the heat pump. The resistive electric element (if your furnace is equipped with one) supplements automatically. Automatic detection of supplemental PTC and conditions for supplemental PTC activation in this mode have not yet been resverse engineered.
+- **Emergency Heat:** Bypasses the heat pump entirely. Only the electric element runs (if equipped). Use only if the heat pump is broken. A warning is displayed on the thermostat.
 
 ---
 
@@ -191,7 +191,7 @@ Pull requests are welcome!
 Areas where community help is especially needed:
 
 - **Dry mode duration control** — setting 15 / 45 / 60 min via the cloud API (see `send_dry_mode()`)
-- **Supplemental PTC detection in normal heat mode** — requires testing at outdoor temperatures below -10°C to identify which payload byte changes when the electric element activates
+- **Supplemental PTC detection in normal heat mode** — requires testing to identify which payload byte changes when the electric element activates
 - **Additional entities** — swing, eco mode, turbo, sleep mode (APK analysis suggests these exist in the protocol but haven't been implemented)
 
 To report a bug or suggest an improvement: [open an issue](../../issues).
