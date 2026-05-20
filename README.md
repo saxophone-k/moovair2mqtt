@@ -8,32 +8,34 @@ Follows the same conventions as [mysa2mqtt](https://github.com/bourquep/mysa2mqt
 >
 > ⚠️ **Stability warning:** This bridge relies entirely on Moovair's **undocumented private cloud API**. If Moovair changes their API, authentication system, or encryption at any time, this bridge may stop working with no warning. Use it knowing this risk.
 >
-> **A note from the author:** I am not a programmer — this entire project was built with the help of [Claude Code](https://claude.ai/code) (AI-assisted development). If you run into issues or have questions, I'll do my best to help, but please keep in mind that my ability to debug code is very limited. That said, feel free to open an issue — maybe someone in the community can step in! 😄
+> **A note from the author:** I am not a programmer — this entire project was built with the help of AI-assisted development. If you run into issues or have questions, I'll do my best to help, but please keep in mind that my ability to debug code is very limited. That said, feel free to open an issue — maybe someone in the community can step in! 😄
 
 ---
 
 ## Features
 
-- ✅ Read ambient temperature, setpoint, HVAC mode, fan mode
-- ✅ Full control from Home Assistant (setpoint, mode, fan)
-- ✅ Power ON/OFF
-- ✅ Modes: Auto, Heat, Cool, Dry, Fan Only, Emergency Heat
-- ✅ Fan speeds: Auto, Low, Medium, High
-- ✅ Aux-Heat sensor (electric backup element active)
-- ✅ Automatic MQTT Discovery (Home Assistant detects the device with zero config)
-- ✅ Automatic re-login when session expires
-- ⚠️ Automatic aux-heat detection in normal heat mode: requires winter testing (TODO)
+- ✅ **Ambient temperature** with **0.5°C precision** (via FCM push from thermostat)
+- ✅ **Indoor humidity** sensor (from thermostat's built-in sensor)
+- ✅ **Heat pump coil temperature** (T4 sensor on outdoor unit — useful for diagnostics)
+- ✅ Full control: setpoint, HVAC mode, fan speed
+- ✅ **Modes:** Auto (heat/cool), Heat, Cool, Fan Only, **Emergency Heat**
+- ✅ **Aux Heat** sensor — shows when the 10kW electric backup element is active (Emergency Heat mode)
+- ✅ **Dry Mode** — dehumidification with 30-minute timer and real-time countdown (see notes below)
+- ✅ Automatic MQTT Discovery (Home Assistant auto-detects device, zero config)
+- ✅ Automatic session re-login when session expires
+- ✅ FCM push for real-time temperature & humidity updates (sub-second latency)
+- ⚠️ Aux-heat detection in normal heat mode (supplemental PTC): requires winter testing at -10°C or below (TODO)
 
 ---
 
 ## Requirements
 
 - **Docker** (to run the bridge as a container)
-- **An MQTT broker** — e.g. [Mosquitto](https://mosquitto.org/). If you're on TrueNAS Scale or similar, you likely already have one running.
+- **An MQTT broker** — e.g. [Mosquitto](https://mosquitto.org/)
 - **Home Assistant** with the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) enabled
 - **A Moovair account** (email + password from the Moovair app)
 
-> ⚠️ **Known limitation:** The Moovair cloud only allows **one active session at a time**. The Moovair app and this bridge cannot run simultaneously — the bridge takes over the session.
+> ⚠️ **Known limitation — session conflict:** The Moovair cloud only supports **one active session per account**. The bridge and the Moovair mobile app cannot run at the same time — the bridge takes over the session and the app gets disconnected. Close the app when the bridge is running.
 
 ---
 
@@ -53,7 +55,7 @@ services:
       M2M_MQTT_PORT: "1883"
       # M2M_MQTT_USERNAME: ""             # if your broker requires auth
       # M2M_MQTT_PASSWORD: ""
-      M2M_POLL_INTERVAL: "5"              # seconds between each poll
+      M2M_POLL_INTERVAL: "30"             # seconds between polls (recommended: 30)
       M2M_LOG_LEVEL: "info"               # debug, info, warning, error
 ```
 
@@ -90,8 +92,8 @@ Home Assistant auto-discovers the thermostat via MQTT Discovery. Check:
 | `M2M_MQTT_USERNAME` | — | — | MQTT username (if auth enabled) |
 | `M2M_MQTT_PASSWORD` | — | — | MQTT password (if auth enabled) |
 | `M2M_MQTT_TOPIC_PREFIX` | — | `moovair2mqtt` | MQTT topic prefix |
-| `M2M_POLL_INTERVAL` | — | `30` | Poll interval in seconds (recommended minimum: 5) |
-| `M2M_LOG_LEVEL` | — | `info` | Log level: debug / info / warning / error |
+| `M2M_POLL_INTERVAL` | — | `30` | Poll interval in seconds |
+| `M2M_LOG_LEVEL` | — | `info` | Log level: `debug` / `info` / `warning` / `error` |
 
 ---
 
@@ -99,32 +101,69 @@ Home Assistant auto-discovers the thermostat via MQTT Discovery. Check:
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| Moovair | `climate` | Full thermostat control |
-| Moovair Aux-Heat | `binary_sensor` | Electric backup element active |
+| Moovair | `climate` | Full thermostat control (mode, setpoint, fan) |
+| Aux Heat | `binary_sensor` | Electric backup element active (Emergency Heat mode) |
+| Indoor Humidity | `sensor` | Relative humidity % from thermostat sensor |
+| Heat Pump Coil Temperature | `sensor` | T4 outdoor unit coil temp (°C) — NOT outdoor ambient |
+| Dry Mode | `switch` | Dehumidification ON/OFF toggle (see notes) |
+| Dry Mode Remaining | `sensor` | Minutes remaining in current dry mode session |
+
+---
+
+## Dry Mode
+
+Dry mode activates the dehumidification function of the ST-1, which reduces humidity without aggressively cooling the room.
+
+### How it works in the Moovair app
+
+The Moovair app offers a dry mode with 4 duration options (15 / 30 / 45 / 60 minutes). The thermostat dehumidifies for the selected duration, then automatically returns to the previous mode.
+
+### Current implementation in this bridge
+
+**Only 30-minute sessions are supported.** The bridge exposes a simple `off` / `30 min` select entity in Home Assistant.
+
+When the switch is turned **ON**:
+1. The bridge sends the dry mode command to the device
+2. The thermostat activates dry mode for 30 minutes
+3. **Dry Mode Remaining** counts down in real time using the thermostat's own timer (live FCM push data — not a bridge-side estimate)
+4. When the timer reaches 0, the switch automatically turns **OFF**
+
+You can also turn the switch **OFF** at any time to cancel dry mode immediately.
+
+**Why only 30 minutes?** The Moovair cloud API provides two separate commands for dry mode: one to set the duration (`dry_time_interval`), and one to activate the mode. Through reverse engineering, we were able to implement the activation reliably. However, setting a custom duration via the cloud API does not appear to take effect when sent through the transparent-send protocol path used by this bridge — the device always uses its last locally-set duration.
+
+**Contributions welcome:** If you can figure out how to reliably set the dry mode duration (15 / 45 / 60 min) via the cloud API, please open a PR! The relevant code is in `MoovairCloud.send_dry_mode()`.
 
 ---
 
 ## MQTT Topics
 
-Topics follow the format `{prefix}/{device_id}/{field}`.
+Topics follow the format `{prefix}/{device_id}/{field}` (default prefix: `moovair2mqtt`).
 
 ### State (bridge → HA)
-| Topic | Values |
-|-------|--------|
-| `.../current_temperature` | e.g. `23.9` |
-| `.../target_temperature` | e.g. `23.0` |
-| `.../mode` | `off`, `heat`, `cool`, `heat_cool`, `fan_only`, `dry` |
-| `.../fan_mode` | `auto`, `low`, `medium`, `high` |
-| `.../action` | `heating`, `cooling`, `idle`, `off`, `fan`, `drying` |
-| `.../aux_heat` | `ON`, `OFF` |
-| `.../availability` | `online`, `offline` |
+
+| Topic | Values | Notes |
+|-------|--------|-------|
+| `.../current_temperature` | e.g. `22.5` | 0.5°C precision from FCM |
+| `.../target_temperature` | e.g. `23.0` | |
+| `.../mode` | `off`, `heat`, `cool`, `heat_cool`, `fan_only`, `emergency_heat` | |
+| `.../fan_mode` | `auto`, `low`, `medium`, `high` | |
+| `.../action` | `heating`, `cooling`, `idle`, `off`, `fan` | |
+| `.../aux_heat` | `ON`, `OFF` | |
+| `.../indoor_humidity` | e.g. `53` | % |
+| `.../outdoor_temperature` | e.g. `29.5` | T4 coil sensor, not ambient |
+| `.../dry_mode` | `ON`, `OFF` | |
+| `.../dry_mode_remaining` | `0`–`30` | Minutes, real thermostat data |
+| `.../availability` | `online`, `offline` | LWT |
 
 ### Commands (HA → bridge)
+
 | Topic | Values |
 |-------|--------|
-| `.../set/mode` | `off`, `heat`, `cool`, `heat_cool`, `fan_only`, `dry` |
+| `.../set/mode` | `off`, `heat`, `cool`, `heat_cool`, `fan_only`, `emergency_heat` |
 | `.../set/target_temperature` | e.g. `22.0` |
 | `.../set/fan_mode` | `auto`, `low`, `medium`, `high` |
+| `.../set/dry_mode` | `ON`, `OFF` |
 
 ---
 
@@ -132,23 +171,28 @@ Topics follow the format `{prefix}/{device_id}/{field}`.
 
 This bridge communicates with the Moovair cloud (Midea NetHomePlus infrastructure) using a reverse-engineered protocol:
 
-1. **Authentication:** SHA256 signature + AES/ECB session key derived from the login response
-2. **State reading:** `app2base/data/transmit` → Lua json2data → `appliance/transparent/send` → AES-encrypted m0 packets
+1. **Authentication:** SHA256 signature + AES/ECB session key derived from login
+2. **State polling:** `app2base/data/transmit` → Lua `json2data` → `appliance/transparent/send` → decoded binary payload
 3. **Control:** Same path with a control JSON payload
-4. **Temperature storage:** The device stores temperatures internally in Fahrenheit (auto-converted to Celsius)
+4. **Live temperature & humidity:** Firebase Cloud Messaging (FCM) — the thermostat pushes state updates every ~11 seconds; `byte[37]` = indoor temp, `byte[36]` = humidity %, `byte[57]` = dry mode remaining minutes
+5. **Precise temperature (0.5°C):** FCM sub-type A1 message, `byte[30]` using formula `(raw - 50) / 2`
 
-### Aux-Heat Behavior
+### Emergency Heat vs. Heat
 
-The electric backup element (aux heat) activates automatically based on **outdoor temperature**, not setpoint delta. It only kicks in when outdoor temperature drops below the system's configured balance point (typically -5°C to -15°C for cold-climate heat pumps).
-
-- Automatic aux-heat byte detection requires winter testing at outdoor temps below -5°C
-- Emergency Heat mode (user-forced aux heat) is fully supported
+- **Heat mode:** Uses the heat pump. The 10kW electric element supplements automatically at very low outdoor temperatures (below the system's balance point, typically -10°C to -15°C). Automatic detection of supplemental PTC in this mode requires winter testing — not yet implemented.
+- **Emergency Heat:** Bypasses the heat pump entirely. Only the 10kW electric element runs. Use only if the heat pump is broken. A warning is displayed on the thermostat.
 
 ---
 
 ## Contributing
 
-Pull requests are welcome! If you have the same thermostat and can test in cold weather, your help mapping the aux-heat bytes would be much appreciated.
+Pull requests are welcome!
+
+Areas where community help is especially needed:
+
+- **Dry mode duration control** — setting 15 / 45 / 60 min via the cloud API (see `send_dry_mode()`)
+- **Supplemental PTC detection in normal heat mode** — requires testing at outdoor temperatures below -10°C to identify which payload byte changes when the electric element activates
+- **Additional entities** — swing, eco mode, turbo, sleep mode (APK analysis suggests these exist in the protocol but haven't been implemented)
 
 To report a bug or suggest an improvement: [open an issue](../../issues).
 

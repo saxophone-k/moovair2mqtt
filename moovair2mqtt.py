@@ -70,9 +70,8 @@ FAN_WRITE = {"low": 30, "medium": 60, "high": 90, "auto": 102}
 MODE_WRITE = {"heat_cool": 1, "cool": 2, "dry": 3, "heat": 4,
               "emergency_heat": 4, "fan_only": 5}
 
-DRY_MODE_OPTIONS  = ["off", "15 min", "20 min", "45 min", "60 min"]
-DRY_MODE_DURATIONS = {"off": 0, "15 min": 15, "20 min": 20, "45 min": 45, "60 min": 60}
 DRY_MODE_REQUIRES = ("cool", "heat_cool")  # modes qui permettent le dry mode
+DRY_MODE_DURATION = 30                    # seule durée supportée via cloud API
 
 def _ts():
     return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
@@ -237,18 +236,65 @@ class MoovairCloud:
         })
         await self._transparent_send(appliance_id, result["result"])
 
-    async def send_dry_mode(self, appliance_id, duration_min: int):
-        """Active ou désactive le dry mode avec une durée en minutes (0 = off)."""
+    async def send_dry_mode(self, appliance_id, duration_min: int,
+                             current_setpoint: float, current_fan: str,
+                             current_hvac_mode: str = "cool"):
+        """Active le dry mode via dry_time_interval + status courant.
+        Le device a besoin du contexte (mode/setpoint/fan) pour savoir où retourner.
+        Confirmé empiriquement : FCM[56]=duration, FCM[57]=remaining countdown.
+        Méthode tirée de l'APK : NATCModel.controlDryTime() + NATCLuaParseHelper.control().
+        Pour désactiver (duration=0) : renvoie le mode précédent via send_control."""
         if duration_min == 0:
-            control = {"smart_dry_switch": 0}
+            await self.send_control(appliance_id, setpoint_c=current_setpoint,
+                                    hvac_mode=current_hvac_mode, fan_mode=current_fan)
         else:
-            control = {"smart_dry_switch": 1, "dry_time_interval": duration_min}
-        result = await self._lua_request("/v1/luacontrol/json2data", {
-            "control": control,
-            "status": "",
-            "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
-        })
-        await self._transparent_send(appliance_id, result["result"])
+            # Flow confirmé depuis l'APK (NATCDehumidificationActivity + NATCModel) :
+            #
+            # 1) controlDryTime(i) → control: {dry_time_interval: i}
+            #    status: generateLuaStatus() = {power, mode(actuel), wind_speed}
+            #    Seuls 3 champs dans le status — pas de temperature
+            #
+            # 2) enableDehumiMode() → controlMode() → control: {power, mode=3, separate_ptc_mode_switch: 0}
+            #    status: generateLuaStatus() APRÈS setModeIndex(3) = {power, mode=3, wind_speed}
+            fan_raw = FAN_WRITE.get(current_fan, 102)
+            current_mode_int = MODE_WRITE.get(current_hvac_mode, 2)
+
+            # Étape 1 : stocker la durée (controlDryTime)
+            status_current = json.dumps({
+                "power": "on",
+                "mode": current_mode_int,
+                "wind_speed": fan_raw,
+            }, separators=(",", ":"))
+            result1 = await self._lua_request("/v1/luacontrol/json2data", {
+                "control": {"dry_time_interval": duration_min},
+                "status":  status_current,
+                "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
+            })
+            try:
+                await self._transparent_send(appliance_id, result1["result"])
+            except RuntimeError as e:
+                if "3176" in str(e):
+                    log.debug("dry_time_interval: pas d'ack (normal)")
+                else:
+                    raise
+
+            # Étape 2 : activer le dry mode (controlMode / enableDehumiMode)
+            # Status avec mode=3 (comme après setModeIndex(3) dans l'APK)
+            status_dry = json.dumps({
+                "power": "on",
+                "mode": 3,
+                "wind_speed": fan_raw,
+            }, separators=(",", ":"))
+            result2 = await self._lua_request("/v1/luacontrol/json2data", {
+                "control": {
+                    "power": "on",
+                    "mode": 3,
+                    "separate_ptc_mode_switch": 0,
+                },
+                "status": status_dry,
+                "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
+            })
+            await self._transparent_send(appliance_id, result2["result"])
 
     async def close(self):
         await self._client.aclose()
@@ -284,6 +330,7 @@ def _decode_state(payload):
         "setpoint":     setpoint_c,
         "fan_mode":     FAN_READ.get(fan_raw, "auto"),
         "heating":      heating,
+        "mode_byte":    mode_byte,
     }
 
 
@@ -310,6 +357,10 @@ class MoovairMQTTBridge:
         self._fcm_client       = None
         self._user_id          = ""
         self._dry_mode         = "off"   # état dry mode local (optimiste)
+        self._dry_remain       = 0       # minutes restantes (FCM[57] ou bridge timer)
+        self._dry_timer_task   = None    # asyncio task pour la minuterie dry mode
+        self._pre_dry_mode     = "cool"  # mode HVAC avant activation dry mode
+        self._dry_activated_at = 0.0    # monotonic timestamp de la dernière activation
         # ── Diagnostics bridge ────────────────────────────────────────────────
         self._diag_last_update    = None  # timestamp ISO dernière poll réussie
         self._diag_last_error     = ""    # texte dernière erreur
@@ -403,15 +454,18 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("sensor", "outdoor_temperature/config"),
             json.dumps(outdoor_temp), retain=True)
 
-        # ── Dry Mode select (minuterie, uniquement en cool ou auto) ─────────
+        # ── Dry Mode switch (toggle ON/OFF, 30 min, cool/auto uniquement) ──
         dry_mode = {
-            "name":          "Dry Mode",
-            "unique_id":     f"moovair_{self.appliance_id}_dry_mode",
-            "device":        dev,
-            "state_topic":   self._topic("dry_mode"),
-            "command_topic": self._topic("set/dry_mode"),
-            "options":       DRY_MODE_OPTIONS,
-            "icon":          "mdi:air-humidifier-off",
+            "name":             "Dry Mode",
+            "unique_id":        f"moovair_{self.appliance_id}_dry_mode",
+            "device":           dev,
+            "state_topic":      self._topic("dry_mode"),
+            "command_topic":    self._topic("set/dry_mode"),
+            "payload_on":       "ON",
+            "payload_off":      "OFF",
+            "state_on":         "ON",
+            "state_off":        "OFF",
+            "icon":             "mdi:air-humidifier",
             "availability": [
                 {
                     "topic":                 self._topic("availability"),
@@ -427,8 +481,12 @@ class MoovairMQTTBridge:
             "availability_mode": "all",
         }
         self._mqtt.publish(
-            self._ha_discovery_topic("select", "dry_mode/config"),
+            self._ha_discovery_topic("switch", "dry_mode/config"),
             json.dumps(dry_mode), retain=True)
+        # Supprimer l'ancienne entité select si elle existait
+        self._mqtt.publish(
+            self._ha_discovery_topic("select", "dry_mode/config"),
+            "", retain=True)
 
         # ── Suppression des anciens sensors de diagnostic de HA ─────────────
         # Payload vide = supprime l'entité dans HA (si elle existait)
@@ -441,9 +499,25 @@ class MoovairMQTTBridge:
             "", retain=True)
         # Note: les diagnostics sont toujours publiés sur diag/* (MQTT brut)
         # pour les développeurs, mais sans entités HA visibles.
+        # ── Dry Mode Remaining (countdown en minutes) ───────────────────────
+        dry_remain = {
+            "name":                 "Dry Mode Remaining",
+            "unique_id":            f"moovair_{self.appliance_id}_dry_remain",
+            "device":               dev,
+            "state_topic":          self._topic("dry_mode_remaining"),
+            "unit_of_measurement":  "min",
+            "state_class":          "measurement",
+            "icon":                 "mdi:timer-outline",
+            "availability_topic":   self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("sensor", "dry_remain/config"),
+            json.dumps(dry_remain), retain=True)
+
         # État initial dry mode (offline = indisponible jusqu'au premier poll)
-        self._mqtt.publish(self._topic("dry_mode"),           "off",     retain=True)
+        self._mqtt.publish(self._topic("dry_mode"),           "OFF",     retain=True)
         self._mqtt.publish(self._topic("dry_mode_available"), "offline", retain=True)
+        self._mqtt.publish(self._topic("dry_mode_remaining"), "0",       retain=True)
         log.info("MQTT Discovery publiée (climate + aux_heat + humidity + coil temp + dry mode)")
 
     def _on_fcm_credentials_updated(self, creds):
@@ -464,10 +538,6 @@ class MoovairMQTTBridge:
                 return
 
             self._fcm_temp_ts = time.monotonic()
-            # Publier un accusé de réception FCM visible dans HA
-            if self.appliance_id:
-                self._mqtt.publish(self._topic("diag/fcm_status"),
-                                   f"message_received len={len(payload)}")
             changed = False
 
             # ── Payload 67 bytes (status condensé, toutes les ~11s) ──────────
@@ -485,6 +555,26 @@ class MoovairMQTTBridge:
                     log.info("FCM indoor humidity: %s%%", humidity)
                     self._fcm_humidity = humidity
                     changed = True
+
+                # byte[56] = dry_time_interval (durée configurée, minutes)
+                # byte[57] = dry_remain_time (minutes restantes, compte à rebours)
+                # Confirmé empiriquement: 30min→[56]=0x1e,[57]=compte de 30 à 0
+                # Mettre à jour le countdown seulement si dry mode est actif
+                # (le device garde [56]/[57] stockés même en cool mode)
+                if len(payload) > 57 and payload[56] > 0 and self._dry_mode != "OFF":
+                    fcm_remain = payload[57]
+                    if fcm_remain != self._dry_remain:
+                        self._dry_remain = fcm_remain
+                        self._mqtt.publish(self._topic("dry_mode_remaining"),
+                                           str(fcm_remain))
+                        changed = True
+                    # FCM[57]=0 → device a fini le dry mode automatiquement
+                    if fcm_remain == 0:
+                        log.info("FCM: dry mode terminé côté device (remain=0)")
+                        self._dry_mode = "OFF"
+                        if self._dry_timer_task and not self._dry_timer_task.done():
+                            self._dry_timer_task.cancel()
+                        self._mqtt.publish(self._topic("dry_mode"), "OFF")
 
             # ── Payload 88 bytes, sous-type A1 (byte[17]==161) ───────────────
             # byte[30] = indoor temp haute précision (formule (byte-50)/2 → 0.5°C)
@@ -535,6 +625,26 @@ class MoovairMQTTBridge:
         body["sign"] = _sign("/v1/user/push/token/update", body)
         await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
         log.debug("FCM token enregistré avec session %s…", self.cloud.session_id[:8])
+
+    async def _dry_mode_timer(self, duration_min: int, setpoint: float, fan: str):
+        """Timer bridge-side — countdown minute par minute, reset auto à expiration."""
+        try:
+            log.info("Dry mode timer: %d min", duration_min)
+            for remaining in range(duration_min, -1, -1):
+                self._dry_remain = remaining
+                self._mqtt.publish(self._topic("dry_mode_remaining"), str(remaining))
+                if remaining == 0:
+                    break
+                await asyncio.sleep(60)
+            log.info("Dry mode timer expiré — retour en %s", self._pre_dry_mode)
+            await self.cloud.send_control(
+                self.appliance_id, setpoint_c=setpoint,
+                hvac_mode=self._pre_dry_mode, fan_mode=fan)
+            self._dry_mode = "OFF"
+            self._mqtt.publish(self._topic("dry_mode"), "OFF")
+            self._last_state = {}
+        except asyncio.CancelledError:
+            log.debug("Dry mode timer annulé")
 
     def _fcm_pub_status(self, status: str):
         """Publie le statut FCM sur MQTT pour diagnostic sans log."""
@@ -648,13 +758,25 @@ class MoovairMQTTBridge:
 
         self._last_state = state.copy()
 
+        # Détecter fin de dry mode via mode_byte (device a quitté mode=3)
+        # Grace period de 90s après activation pour laisser le device changer de mode
+        dry_grace = time.monotonic() - self._dry_activated_at < 90
+        if self._dry_mode != "OFF" and state.get("mode_byte") != 3 and not dry_grace:
+            log.info("Dry mode terminé côté device — reset")
+            self._dry_mode = "OFF"
+            self._dry_remain = 0
+            self._mqtt.publish(self._topic("dry_mode_remaining"), "0")
+            if self._dry_timer_task and not self._dry_timer_task.done():
+                self._dry_timer_task.cancel()
+                self._dry_timer_task = None
+
         # Dry mode : disponibilité selon le mode HVAC courant
         dry_ok = state["hvac_mode"] in DRY_MODE_REQUIRES
         self._mqtt.publish(self._topic("dry_mode_available"),
                            "online" if dry_ok else "offline")
-        if not dry_ok and self._dry_mode != "off":
-            self._dry_mode = "off"
-            self._mqtt.publish(self._topic("dry_mode"), "off")
+        if not dry_ok and self._dry_mode != "OFF":
+            self._dry_mode = "OFF"
+            self._mqtt.publish(self._topic("dry_mode"), "OFF")
         else:
             self._mqtt.publish(self._topic("dry_mode"), self._dry_mode)
 
@@ -672,11 +794,11 @@ class MoovairMQTTBridge:
 
         # ── Commande dry mode (gérée séparément, pas via cmd_queue) ──────────
         if cmd == "dry_mode":
-            if payload not in DRY_MODE_OPTIONS:
+            if payload not in ("ON", "OFF"):
                 log.warning("Dry mode invalide: %s", payload)
                 return
             current_mode = self._last_state.get("hvac_mode", "off")
-            if payload != "off" and current_mode not in DRY_MODE_REQUIRES:
+            if payload == "ON" and current_mode not in DRY_MODE_REQUIRES:
                 log.warning("Dry mode ignoré — mode HVAC actuel: %s", current_mode)
                 return
             if self._loop:
@@ -709,7 +831,7 @@ class MoovairMQTTBridge:
             log.info("MQTT connecté à %s:%s", CFG["mqtt_host"], CFG["mqtt_port"])
             # Re-abonner aux topics de commande à chaque reconnexion
             prefix = self._topic("set/")
-            for cmd in ("mode", "target_temperature", "fan_mode"):
+            for cmd in ("mode", "target_temperature", "fan_mode", "dry_mode"):
                 self._mqtt.subscribe(f"{prefix}{cmd}")
                 log.debug("Abonné: %s%s", prefix, cmd)
             # Re-publier "online" après reconnexion (annule le LWT "offline")
@@ -726,14 +848,34 @@ class MoovairMQTTBridge:
 
         # ── Commande dry mode ────────────────────────────────────────────────
         if "dry_mode" in cmd_state:
-            option   = cmd_state["dry_mode"]
-            duration = DRY_MODE_DURATIONS.get(option, 0)
-            log.info("Dry mode: %s (%d min)", option, duration)
+            activate = cmd_state["dry_mode"] == "ON"
+            duration = DRY_MODE_DURATION if activate else 0
+            setpoint = self._last_state.get("setpoint", 23.0)
+            fan      = self._last_state.get("fan_mode", "auto")
+            log.info("Dry mode: %s", "ON (30 min)" if activate else "OFF")
+            # Annuler le timer existant si présent
+            if self._dry_timer_task and not self._dry_timer_task.done():
+                self._dry_timer_task.cancel()
+                self._dry_timer_task = None
+            # Mise à jour optimiste AVANT l'envoi
+            if activate:
+                self._pre_dry_mode = self._last_state.get("hvac_mode", "cool")
+                self._dry_activated_at = time.monotonic()
+                self._dry_mode = "ON"
+            else:
+                self._dry_remain = 0
+                self._mqtt.publish(self._topic("dry_mode_remaining"), "0")
+                self._dry_mode = "OFF"
+            self._mqtt.publish(self._topic("dry_mode"), self._dry_mode)
             try:
-                await self.cloud.send_dry_mode(self.appliance_id, duration)
-                self._dry_mode = option
-                self._mqtt.publish(self._topic("dry_mode"), option)
-                log.info("Dry mode appliqué: %s", option)
+                await self.cloud.send_dry_mode(self.appliance_id, duration,
+                                               current_setpoint=setpoint,
+                                               current_fan=fan,
+                                               current_hvac_mode=self._pre_dry_mode)
+                log.info("Dry mode appliqué: %s", self._dry_mode)
+                if activate:
+                    self._dry_timer_task = asyncio.ensure_future(
+                        self._dry_mode_timer(duration, setpoint, fan))
             except Exception as e:
                 log.error("Erreur dry mode: %s", e)
             return
