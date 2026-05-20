@@ -120,7 +120,7 @@ The Moovair app offers a dry mode with 4 duration options (15 / 30 / 45 / 60 min
 
 ### Current implementation in this bridge
 
-**Only 30-minute sessions are supported.** The bridge exposes a simple `off` / `30 min` select entity in Home Assistant.
+**Only 30-minute sessions are supported.** The bridge exposes a simple `ON/OFF` select entity in Home Assistant.
 
 When the switch is turned **ON**:
 1. The bridge sends the dry mode command to the device
