@@ -102,7 +102,7 @@ Home Assistant auto-discovers the thermostat via MQTT Discovery. Check:
 | Entity | Type | Description |
 |--------|------|-------------|
 | Moovair | `climate` | Full thermostat control (mode, setpoint, fan) |
-| Aux Heat | `binary_sensor` | Electric backup element active (Emergency Heat mode) |
+| Aux Heat | `binary_sensor` | Electric backup element active |
 | Indoor Humidity | `sensor` | Relative humidity % from thermostat sensor |
 | Heat Pump Coil Temperature | `sensor` | T4 outdoor unit coil temp (°C) — NOT outdoor ambient |
 | Dry Mode | `switch` | Dehumidification ON/OFF toggle (see notes) |
