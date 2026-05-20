@@ -221,16 +221,30 @@ class MoovairCloud:
         return _decode_state(payload)
 
     async def send_control(self, appliance_id, *, setpoint_c, hvac_mode, fan_mode="auto"):
+        # Valeurs confirmées depuis APK NATCModel.controlMode() :
+        # Emergency heat : ptc="off", separate_ptc_mode_switch=1 (entier)
+        # Normal heat    : ptc="on",  separate_ptc_mode_switch=0 (entier)
+        # covertIntOnOFFToLua() retourne int (1/0), covertOnOFFToLua() retourne string
         mode_lua = MODE_WRITE.get(hvac_mode, 4)
         fan_lua  = FAN_WRITE.get(fan_mode, 102)
         power    = "off" if hvac_mode == "off" else "on"
-        separate_ptc = "on" if hvac_mode == "emergency_heat" else "off"
-        result = await self._lua_request("/v1/luacontrol/json2data", {
-            "control": {
+        # ptc field cause "réponse vide" — ne pas l'inclure
+        # separate_ptc_mode_switch: entier 1 = PTC standalone (emergency heat)
+        #                           entier 0 = heat pump (normal heat)
+        if hvac_mode == "emergency_heat":
+            control = {
+                "power": "on", "mode": 4,
+                "temperature": float(setpoint_c), "wind_speed": fan_lua,
+                "separate_ptc_mode_switch": 1,
+            }
+        else:
+            control = {
                 "power": power, "mode": mode_lua,
                 "temperature": float(setpoint_c), "wind_speed": fan_lua,
-                "separate_ptc_mode_switch": separate_ptc,
-            },
+                "separate_ptc_mode_switch": 0,
+            }
+        result = await self._lua_request("/v1/luacontrol/json2data", {
+            "control": control,
             "status": "",
             "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
         })
@@ -308,6 +322,10 @@ def _decode_state(payload):
     heat_pump  = payload[18] == 8
     fan_raw    = payload[23]
     heating    = bool(payload[85]) if len(payload) > 85 else False
+    # payload[40] bit2 = élément résistif (PTC) physiquement actif
+    # Confirmé empiriquement : [40]=0x34 (serpentin allumé) vs 0x30 (éteint)
+    # Valide pour emergency heat ET le supplément PTC en heat normal (hiver)
+    ptc_active = bool(payload[40] & 0x04) if len(payload) > 40 else False
 
     if power == 0:
         hvac_mode = "off"
@@ -315,17 +333,14 @@ def _decode_state(payload):
     elif mode_byte == 1: hvac_mode = "heat_cool";      action = "heating" if heating else "idle"
     elif mode_byte == 2: hvac_mode = "cool";            action = "cooling" if heating else "idle"
     elif mode_byte == 3: hvac_mode = "cool";            action = "cooling" if heating else "idle"
-    elif mode_byte == 4 and heat_pump:
-                         hvac_mode = "heat";            action = "heating" if heating else "idle"
-    elif mode_byte == 4 and not heat_pump:
-                         hvac_mode = "emergency_heat";  action = "heating" if heating else "idle"
+    elif mode_byte == 4: hvac_mode = "heat";            action = "heating" if heating else "idle"
     elif mode_byte == 5: hvac_mode = "fan_only";        action = "fan"
     else:                hvac_mode = "off";             action = "off"
 
     return {
         "hvac_mode":    hvac_mode,
         "action":       action,
-        "aux_heat":     hvac_mode == "emergency_heat" and heating,
+        "aux_heat":     ptc_active,
         "current_temp": None,
         "setpoint":     setpoint_c,
         "fan_mode":     FAN_READ.get(fan_raw, "auto"),
@@ -387,7 +402,7 @@ class MoovairMQTTBridge:
             "name":                         "Moovair",
             "unique_id":                    f"moovair_{self.appliance_id}",
             "device":                       dev,
-            "modes":                        ["off", "heat_cool", "heat", "cool", "fan_only", "emergency_heat"],
+            "modes":                        ["off", "heat_cool", "heat", "cool", "fan_only"],
             "fan_modes":                    ["auto", "low", "medium", "high"],
             "current_temperature_topic":    self._topic("current_temperature"),
             "temperature_state_topic":      self._topic("target_temperature"),
@@ -415,7 +430,7 @@ class MoovairMQTTBridge:
             "state_topic":    self._topic("aux_heat"),
             "payload_on":     "ON",
             "payload_off":    "OFF",
-            "icon":           "mdi:lightning-bolt",
+            "icon":           "mdi:heating-coil",
             "availability_topic": self._topic("availability"),
         }
         self._mqtt.publish(
@@ -440,7 +455,7 @@ class MoovairMQTTBridge:
 
         # ── Heat Pump Coil Temperature (T4, unité extérieure) ────────────
         outdoor_temp = {
-            "name":                 "Heat Pump Coil Temperature",
+            "name":                 "Outdoor Coil Temperature",
             "unique_id":            f"moovair_{self.appliance_id}_outdoor_temp",
             "device":               dev,
             "state_topic":          self._topic("outdoor_temperature"),
@@ -488,6 +503,25 @@ class MoovairMQTTBridge:
             self._ha_discovery_topic("select", "dry_mode/config"),
             "", retain=True)
 
+        # ── Heat Pump binary sensor (compresseur unité extérieure actif) ────────
+        heat_pump = {
+            "name":           "Heat Pump",
+            "unique_id":      f"moovair_{self.appliance_id}_heat_pump",
+            "device":         dev,
+            "state_topic":    self._topic("heat_pump"),
+            "payload_on":     "ON",
+            "payload_off":    "OFF",
+            "icon":           "mdi:heat-pump",
+            "availability_topic": self._topic("availability"),
+        }
+        self._mqtt.publish(
+            self._ha_discovery_topic("binary_sensor", "heat_pump/config"),
+            json.dumps(heat_pump), retain=True)
+        # Supprimer l'ancien switch emergency_heat si présent
+        self._mqtt.publish(
+            self._ha_discovery_topic("switch", "emergency_heat/config"),
+            "", retain=True)
+
         # ── Suppression des anciens sensors de diagnostic de HA ─────────────
         # Payload vide = supprime l'entité dans HA (si elle existait)
         for old in ("last_update/config", "last_error/config",
@@ -518,6 +552,7 @@ class MoovairMQTTBridge:
         self._mqtt.publish(self._topic("dry_mode"),           "OFF",     retain=True)
         self._mqtt.publish(self._topic("dry_mode_available"), "offline", retain=True)
         self._mqtt.publish(self._topic("dry_mode_remaining"), "0",       retain=True)
+        self._mqtt.publish(self._topic("heat_pump"),           "OFF",     retain=True)
         log.info("MQTT Discovery publiée (climate + aux_heat + humidity + coil temp + dry mode)")
 
     def _on_fcm_credentials_updated(self, creds):
@@ -730,7 +765,8 @@ class MoovairMQTTBridge:
         self._mqtt.publish(t("mode"),                state["hvac_mode"])
         self._mqtt.publish(t("fan_mode"),            state["fan_mode"])
         self._mqtt.publish(t("action"),              state["action"])
-        self._mqtt.publish(t("aux_heat"),            "ON" if state["aux_heat"] else "OFF")
+        self._mqtt.publish(t("aux_heat"),   "ON" if state["aux_heat"] else "OFF")
+        self._mqtt.publish(t("heat_pump"), "ON" if state["heating"] else "OFF")
         self._mqtt.publish(t("availability"),        "online")
 
         # Diagnostics bridge
