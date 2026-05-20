@@ -19,7 +19,7 @@ Follows the same conventions as [mysa2mqtt](https://github.com/bourquep/mysa2mqt
 - ✅ **Heat pump coil temperature** (T4 sensor on outdoor unit — useful for diagnostics)
 - ✅ Full control: setpoint, HVAC mode, fan speed
 - ✅ **Modes:** Auto (heat/cool), Heat, Cool, Fan Only, **Emergency Heat**
-- ✅ **Aux Heat** sensor — shows when the 10kW electric backup element is active (Emergency Heat mode)
+- ⚠️ **Aux Heat** sensor — needs more reverse engineering. Is not currently working reliably
 - ✅ **Dry Mode** — dehumidification with 30-minute timer and real-time countdown (see notes below)
 - ✅ Automatic MQTT Discovery (Home Assistant auto-detects device, zero config)
 - ✅ Automatic session re-login when session expires
