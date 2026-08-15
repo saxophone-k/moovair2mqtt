@@ -261,6 +261,34 @@ Set `M2M_CLOUD_MODE: "local_only"` when you have firewalled the device, and the 
 
 **Recommended:** block the thermostat's WAN access at your router, keep LAN access. You lose a decorative weather icon and the phone app; you gain immunity from vendor updates breaking your thermostat.
 
+### How to block it — one firewall rule
+
+The whole job is a single rule at your router or firewall: **deny the thermostat's IP from reaching the internet, while leaving it reachable on your LAN.**
+
+```
+Source:       the thermostat's IP  (give it a fixed IP first)
+Destination:  WAN / internet
+Action:       DENY (drop)
+```
+
+Leave LAN↔LAN traffic alone — the bridge reaches the thermostat over your LAN, so that path must stay open. Do **not** use a blanket "deny all" that also blocks the LAN, or you lose Home Assistant too.
+
+**Example — TP-Link Omada:** put the thermostat's IP in an IP Group, then add a Gateway ACL: *direction* LAN→WAN, *policy* Deny, *source* = that IP Group, *destination* = Any. (The LAN→WAN direction already limits it to internet-bound traffic, so "Any" destination is correct and does not touch the LAN.) The same shape works on pfSense, OPNsense, UniFi, OpenWrt, or any router with per-device firewall rules.
+
+> ⚠️ **A DNS blocker (Pi-hole / AdGuard) is NOT enough on its own.** This thermostat **caches its cloud server's IP address and dials it directly**, and it hardcodes public DNS servers (`8.8.8.8`, `1.1.1.1`) rather than using the one your network hands out. So a DNS-based block is simply ignored. **You must block the WAN path**, as above.
+
+### Tested and verified
+
+Verified on the reference unit (2-wire ST-1) on 2026-08-15, with the WAN rule active:
+
+- ✅ **Home Assistant and the bridge are completely unaffected** — all entities keep updating over the LAN.
+- ✅ **The thermostat boots normally with no internet** — its own control and panel come up fine; there is no "waiting for cloud" hang, on a cold boot with the internet already blocked.
+- ✅ **The cloud client fails gracefully** — it retries on a slow backoff and never destabilises the device (no CPU runaway, no crash loop).
+- ✅ **A hardware clock keeps the time** across reboots; without internet NTP the clock only drifts slowly, and the NTP servers are configurable if you care.
+- ❌ As expected, the **Moovair phone app stops working** and the **panel weather icon goes blank** — both are cloud-only. Set `M2M_CLOUD_MODE: "local_only"` so the bridge hides the weather sensor.
+
+Want app-style remote control from outside your home without the cloud? Put Home Assistant behind a VPN (Tailscale, WireGuard) — you control the thermostat through HA from anywhere, and nothing ever touches the vendor's servers.
+
 ---
 
 ## How it works
