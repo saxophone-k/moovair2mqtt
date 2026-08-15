@@ -519,6 +519,11 @@ class Bridge:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.state = State()
+        # Guards `state` against torn reads. The reader thread rewrites these
+        # fields continuously while the command thread assembles frames from
+        # them; see `_full_tlv` for why a half-updated snapshot is dangerous.
+        # (Device._lock is unrelated — that one serialises ADB sends.)
+        self._state_lock = threading.Lock()
         self.device = Device(cfg)
         self.cmd_q: queue.Queue = queue.Queue()
         self.mqtt = None
@@ -753,21 +758,35 @@ class Bridge:
 
     # ── command handling ─────────────────────────────────────────────────
     def _full_tlv(self, **over):
-        """Channel A frames are sent complete — proven safe. Order matters."""
-        st = self.state
+        """Channel A frames are sent complete — proven safe. Order matters.
+
+        ⚠ Every frame carries power + setpoint + fan + mode, so the three fields
+        the caller did NOT set are filled in from current state. Reading them
+        one at a time lets the reader thread change state mid-read, producing a
+        frame that mixes two different moments — e.g. a new setpoint sent
+        alongside a stale mode, snapping the thermostat back to where it was.
+        The window is microseconds and has never been observed, but the failure
+        would be silent and baffling, so take ONE consistent snapshot instead.
+        """
+        with self._state_lock:
+            cur_power = self.state.power
+            cur_setpoint = self.state.setpoint
+            cur_fan = self.state.fan
+            cur_mode = self.state.mode
+
         if "power" in over:
             power = over["power"]
-        elif st.power is None:
+        elif cur_power is None:
             power = 0x03                     # state unknown yet — assume on
         else:
             # ⚠ Must PRESERVE the current power state. `st.power or 1` was always
             # truthy, so changing the setpoint or fan while the unit was OFF
             # silently switched it ON. Only reachable once core controls moved to
             # Channel A (2026-08-14).
-            power = 0x03 if st.power else 0x00
-        sp = over.get("setpoint", st.setpoint or 22.0)
-        fan = over.get("fan", st.fan if st.fan is not None else 3)
-        mode = over.get("mode", st.mode or MODE_COOL)
+            power = 0x03 if cur_power else 0x00
+        sp = over.get("setpoint", cur_setpoint or 22.0)
+        fan = over.get("fan", cur_fan if cur_fan is not None else 3)
+        mode = over.get("mode", cur_mode or MODE_COOL)
         tags = [(TLV_POWER, power),
                 (TLV_SETPOINT, int(round(sp * 2 + 50))),
                 (TLV_FAN, FAN_TLV.get(fan, 0x66))]
@@ -905,8 +924,13 @@ class Bridge:
                                                   transport_timeout_s=None):
                     if self._stop.is_set():
                         break
-                    for line in chunk.splitlines():
-                        parse_line(line, self.state)
+                    # One acquire per chunk, not per line: `logread` delivers
+                    # ~200 lines/s and parse_line only mutates state (it cannot
+                    # publish or block), so holding it across the chunk is cheap
+                    # and keeps the command thread from seeing a partial update.
+                    with self._state_lock:
+                        for line in chunk.splitlines():
+                            parse_line(line, self.state)
                     if chunk:
                         self.set_device_online(True, "log stream active")
             except Exception as exc:
