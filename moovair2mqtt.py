@@ -1,1065 +1,1047 @@
 #!/usr/bin/env python3
 """
-moovair2mqtt — Bridge Moovair ST-1 (thermopompe) ↔ MQTT ↔ Home Assistant
-Suit la même convention que mysa2mqtt (variables M2M_*).
+moovair2mqtt v3 — LOCAL bridge (no cloud, no Midea account).
+
+Talks directly to the thermostat's Wi-Fi module over ADB:
+  READ  : tail `logread` and parse dev_app / meiju state lines
+  WRITE : inject into dev_app's SysV message queue (msqid 1) via `msgtool`
+
+Protocol reference: local_recon/DEVICE_MAP.md, KV_MAP.md, COMMAND_MAP.md
+Design spec:        local_recon/BRIDGE_NOTES.md
+
+Everything here was verified against real hardware unless marked UNVERIFIED.
 """
 
-import asyncio
-import hashlib
+from __future__ import annotations
+
 import json
 import logging
 import os
-import signal
+import queue
+import re
 import struct
+import sys
+import threading
 import time
-from datetime import datetime, timezone
-from urllib.parse import unquote_plus, urlencode, urlparse
 
-import httpx
 import paho.mqtt.client as mqtt
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-from firebase_messaging import FcmPushClient, FcmRegisterConfig
 
-# ── Configuration depuis variables d'environnement ───────────────────────────
+try:
+    from adb_shell.adb_device import AdbDeviceTcp
+except ImportError:  # pragma: no cover
+    AdbDeviceTcp = None
 
-def _env(key, default=None, required=False):
-    val = os.environ.get(key, default)
-    if required and not val:
-        raise SystemExit(f"Variable d'environnement requise manquante: {key}")
-    return val
+LOG = logging.getLogger("moovair-local")
 
-CFG = {
-    "moovair_email":    _env("M2M_MOOVAIR_USERNAME", required=True),
-    "moovair_password": _env("M2M_MOOVAIR_PASSWORD", required=True),
-    "mqtt_host":        _env("M2M_MQTT_HOST", required=True),
-    "mqtt_port":        int(_env("M2M_MQTT_PORT", "1883")),
-    "mqtt_user":        _env("M2M_MQTT_USERNAME", ""),
-    "mqtt_pass":        _env("M2M_MQTT_PASSWORD", ""),
-    "mqtt_prefix":      _env("M2M_MQTT_TOPIC_PREFIX", "moovair2mqtt"),
-    "poll_interval":    int(_env("M2M_POLL_INTERVAL", "30")),
-    "log_level":        _env("M2M_LOG_LEVEL", "info").upper(),
+# ─────────────────────────────────────────────────────────────────────────────
+# Protocol constants — see DEVICE_MAP.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+MSQID = 1
+MSG_LEN = 1056                 # dev_app's fixed rac_queue message size
+
+TYPE_TLV = 0x30000             # Channel A — `aa .. 44` TLV frame
+TYPE_KV = 0                    # Channel B — key/value
+TYPE_QUERY = 2                 # read-only state request (no setters fire)
+
+# Channel B (KV) keys
+KV_POWER = 0
+KV_SETPOINT = 1                # float
+KV_FAN = 2
+KV_MODE = 3
+KV_AUX_HEAT = 30               # setEleFunc   — PTC *with* heat pump
+KV_EMERGENCY = 31              # setElecHeatAlone — PTC alone
+
+# Channel A (TLV) tags
+TLV_POWER = 1
+TLV_MODE = 2
+TLV_SETPOINT = 3
+TLV_FAN = 4
+TLV_DEHUM_INTERVAL = 0x71      # MUST precede the mode tag or it is dropped
+# Emergency-heat tags, captured from the official app 2026-08-14. These are
+# handled by `msmart_cmd_ctrl` — a DIFFERENT Channel-A sub-handler from
+# `parse_tlv_hbs_cmd` — and it is the one that calls
+# `rac_dev_notify_ui_state_update`, so the thermostat's screen updates.
+TLV_AUX_41 = 0x41              # always 2 in the app's frames
+TLV_EMERGENCY = 0x67           # 3 = emergency heat, 2 = normal
+TLV_PTC = 0x1F                 # bit0 = ptc enabled: 0x0b normal, 0x0a emergency
+# Captured from the app 2026-08-14. Same 2/3 encoding as TLV_EMERGENCY.
+TLV_FREEZE = 0x41              # 3 = freeze protection (8 C) ON, 2 = OFF
+TLV_TEMP_UNIT = 0x47           # 0 = Celsius, 1 = Fahrenheit
+
+# ac_mode_t
+MODE_AUTO, MODE_COOL, MODE_DRY, MODE_HEAT, MODE_FAN = 1, 2, 3, 4, 5
+
+HVAC_FROM_MODE = {
+    MODE_AUTO: "heat_cool",
+    MODE_COOL: "cool",
+    MODE_DRY: "cool",          # Option B: dry shows as cool, like the panel
+    MODE_HEAT: "heat",
+    MODE_FAN: "fan_only",
+}
+MODE_FROM_HVAC = {
+    "heat_cool": MODE_AUTO,
+    "cool": MODE_COOL,
+    "heat": MODE_HEAT,
+    "fan_only": MODE_FAN,
 }
 
-logging.basicConfig(
-    level=getattr(logging, CFG["log_level"], logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("moovair2mqtt")
+FAN_FROM_IDX = {0: "low", 1: "medium", 2: "high", 3: "auto"}
+FAN_TO_IDX = {v: k for k, v in FAN_FROM_IDX.items()}
+FAN_TLV = {0: 0x1E, 1: 0x3C, 2: 0x5A, 3: 0x66}
 
-# ── Constantes protocole Moovair / Midea NetHomePlus ─────────────────────────
+PRESET_NORMAL = "Normal"
+PRESET_EMERGENCY = "Emergency Heat"
 
-BASE_URL     = "https://mapp-us.appsmb.com"
-APP_ID       = "1244"
-APP_KEY      = "51b9a382052143058fda97925a423a93"
-SRC          = "17"
-APPLIANCE_ID = None   # découvert au login
-DEVICE_SN    = "bridge"
+TEMP_OFFSET = 62               # UART sensor bytes: °C = raw - 62
 
-# ── Firebase Cloud Messaging (température ambiante via push) ──────────────────
-FCM_SENDER_ID   = "1016425309209"
-FCM_APP_ID      = "1:1016425309209:android:a397210f6f94bc2d7f3688"
-FCM_PROJECT_ID  = "moovair"
-FCM_API_KEY     = "AIzaSyA7HhxqQhZ5zfc1euu-HK6B3CZfAtNjrek"
-FCM_MAX_SILENCE = 600   # secondes sans push → force reconnexion
-FCM_TEMP_MAX_AGE = 900  # secondes : ne pas publier une temp plus vieille que ça
+# available_mode bitmask → which hvac modes the unit supports.
+# The reference unit reports 0x7f. Bit meanings are INFERRED; when a bit is unknown
+# we keep the mode rather than hide a working one.
+AVAILABLE_MODE_BITS = {
+    MODE_AUTO: 0x01, MODE_COOL: 0x02, MODE_DRY: 0x04,
+    MODE_HEAT: 0x08, MODE_FAN: 0x10,
+}
 
-FAN_READ  = {30: "low", 60: "medium", 90: "high", 102: "auto"}
-FAN_WRITE = {"low": 30, "medium": 60, "high": 90, "auto": 102}
-MODE_WRITE = {"heat_cool": 1, "cool": 2, "dry": 3, "heat": 4,
-              "emergency_heat": 4, "fan_only": 5}
 
-DRY_MODE_REQUIRES = ("cool", "heat_cool")  # modes qui permettent le dry mode
-DRY_MODE_DURATION = 30                    # seule durée supportée via cloud API
+# ─────────────────────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _ts():
-    return datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-
-def _sign(path, params):
-    query = unquote_plus(urlencode(sorted(params.items())))
-    return hashlib.sha256((path + query + APP_KEY).encode()).hexdigest()
-
-def _aes_dec_session_key(access_token_hex):
-    key = hashlib.md5(APP_KEY.encode()).hexdigest()[:16].encode()
-    ct  = bytes.fromhex(access_token_hex)
-    return unpad(AES.new(key, AES.MODE_ECB).decrypt(ct), 16).decode()
-
-def _aes_enc(text, sk):
-    return AES.new(sk.encode(), AES.MODE_ECB).encrypt(pad(text.encode(), 16)).hex()
-
-def _aes_dec(hex_data, sk):
-    ct = bytes.fromhex(hex_data)
-    return unpad(AES.new(sk.encode(), AES.MODE_ECB).decrypt(ct), 16).decode()
-
-def _fcm_decrypt_push(msg_hex, user_id):
-    """Déchiffre un message push FCM Moovair → retourne les bytes payload Midea."""
-    if not msg_hex:
+def _env(name, default=None, required=False):
+    val = os.environ.get(name, default)
+    if required and not val:
         return None
-    try:
-        key = hashlib.md5((user_id + APP_KEY).encode()).hexdigest()[:16].encode()
-        ct  = bytes.fromhex(msg_hex)
-        dec = unpad(AES.new(key, AES.MODE_ECB).decrypt(ct), 16).decode()
-        nums   = [int(x) for x in dec.split(',') if x.strip()]
-        m0b    = bytes([n & 0xFF for n in nums])
-        total  = struct.unpack('<H', m0b[4:6])[0]
-        return m0b[40:40 + (total - 56)]
-    except Exception:
-        return None
+    return val
 
 
-# ── Client Cloud Moovair ──────────────────────────────────────────────────────
-
-class MoovairCloud:
+class Config:
     def __init__(self):
-        self.session_id   = ""
-        self.session_key  = ""
-        self._client      = httpx.AsyncClient(timeout=15.0)
-
-    def _auth_body(self, extra=None):
-        body = {"appId": APP_ID, "clientType": "1", "format": "2",
-                "stamp": _ts(), "language": "en_US", "src": SRC}
-        if extra:
-            body.update(extra)
-        return body
-
-    async def _post(self, endpoint, body):
-        body["sign"] = _sign(endpoint, body)
-        r = await self._client.post(f"{BASE_URL}{endpoint}", data=body)
-        resp = r.json()
-        if str(resp.get("errorCode", resp.get("code", "1"))) != "0":
-            raise RuntimeError(f"{endpoint} → {resp.get('msg', resp)}")
-        return resp.get("result") or resp.get("data")
-
-    async def login(self):
-        log.info("Login Moovair cloud...")
-        # 1) Obtenir le loginId
-        result = await self._post("/v1/user/login/id/get",
-            self._auth_body({"loginAccount": CFG["moovair_email"]}))
-        login_id = result["loginId"]
-
-        # 2) Calculer le password hash: SHA256(loginId + SHA256(password) + APP_KEY)
-        pw_hash = hashlib.sha256(CFG["moovair_password"].encode()).hexdigest()
-        full    = (login_id + pw_hash + APP_KEY).encode()
-        password = hashlib.sha256(full).hexdigest()
-
-        # 3) Login
-        result = await self._post("/v1/user/login",
-            self._auth_body({"loginAccount": CFG["moovair_email"],
-                             "password":      password}))
-
-        self.session_id  = result["sessionId"]
-        self.session_key = _aes_dec_session_key(result["accessToken"])
-        self.user_id     = result.get("userId", "")
-        log.info("Login OK — sessionKey: %s…", self.session_key[:8])
-
-    async def get_appliance_id(self):
-        body = {"format": "2", "stamp": _ts(), "language": "en_US",
-                "src": SRC, "sessionId": self.session_id}
-        result = await self._post("/v1/appliance/user/list/get", body)
-        devices = result.get("list", [])
-        if not devices:
-            raise RuntimeError("Aucun appareil trouvé dans le compte Moovair")
-        dev = devices[0]
-        log.info("Appareil trouvé: id=%s type=%s name=%s online=%s",
-                 dev["id"], dev.get("type"), dev.get("name"), dev.get("onlineStatus"))
-        return dev["id"], dev
-
-    async def _lua_request(self, service_url, body_dict):
-        lua_json = json.dumps(body_dict, separators=(",", ":"))
-        data_hex = _aes_enc(lua_json, self.session_key)
-        endpoint = "/v1/app2base/data/transmit"
-        form = {"format": "2", "stamp": _ts(), "language": "en_US",
-                "src": SRC, "sessionId": self.session_id,
-                "proType": "0x01", "data": data_hex, "serviceUrl": service_url}
-        form["sign"] = _sign(endpoint, form)
-        r = await self._client.post(f"{BASE_URL}{endpoint}?serviceUrl={service_url}",
-                                    data=form)
-        resp = r.json()
-        if str(resp.get("errorCode")) != "0":
-            raise RuntimeError(f"lua_request {service_url}: {resp}")
-        raw = resp.get("result", {})
-        if isinstance(raw, dict):
-            raw = raw.get("returnData", "")
-        if not raw:
-            raise RuntimeError(f"lua_request {service_url}: réponse vide")
-        return json.loads(_aes_dec(raw, self.session_key))
-
-    async def _transparent_send(self, appliance_id, cmd_bytes_str):
-        raw_bytes = bytes([int(b, 16) for b in cmd_bytes_str.split(",")])
-        now  = time.localtime()
-        ms   = int((time.time() % 1) * 1000)
-        h    = bytes([ms & 0xFF, now.tm_sec, now.tm_min, now.tm_hour,
-                      now.tm_mday, now.tm_mon - 1, now.tm_year % 100, now.tm_year // 100])
-        i    = int(appliance_id).to_bytes(8, 'little')[:6]
-        tlen = len(raw_bytes) + 56
-        m0   = (bytes([0x5A, 0x5A, 1, 0])
-                + struct.pack('<H', tlen) + struct.pack('<H', 32)
-                + struct.pack('<I', 1) + h + i
-                + bytes(8) + bytes(6) + raw_bytes + bytes(16))
-        signed = ",".join(str((b - 256) if b > 127 else b) for b in m0)
-        enc    = _aes_enc(signed, self.session_key)
-        body   = {"format": "2", "stamp": _ts(), "language": "en_US",
-                  "src": SRC, "sessionId": self.session_id,
-                  "applianceId": appliance_id, "funId": "0008", "order": enc}
-        body["sign"] = _sign("/v1/appliance/transparent/send", body)
-        r = await self._client.post(f"{BASE_URL}/v1/appliance/transparent/send", data=body)
-        resp = r.json()
-        if str(resp.get("errorCode")) != "0":
-            raise RuntimeError(f"transparent_send: {resp}")
-        reply_dec = _aes_dec(resp["result"]["reply"], self.session_key)
-        m0_bytes  = bytes([int(v) & 0xFF for v in reply_dec.split(",")])
-        total     = struct.unpack('<H', m0_bytes[4:6])[0]
-        return m0_bytes[40:40 + (total - 56)]
-
-    async def read_state(self, appliance_id):
-        result = await self._lua_request("/v1/luacontrol/json2data", {
-            "query": {"query_type": "query_all,display_status_query,central_control_special_data_query,indoor_run_status"},
-            "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
-        })
-        payload = await self._transparent_send(appliance_id, result["result"])
-        return _decode_state(payload)
-
-    async def send_control(self, appliance_id, *, setpoint_c, hvac_mode, fan_mode="auto"):
-        # Valeurs confirmées depuis APK NATCModel.controlMode() :
-        # Emergency heat : ptc="off", separate_ptc_mode_switch=1 (entier)
-        # Normal heat    : ptc="on",  separate_ptc_mode_switch=0 (entier)
-        # covertIntOnOFFToLua() retourne int (1/0), covertOnOFFToLua() retourne string
-        mode_lua = MODE_WRITE.get(hvac_mode, 4)
-        fan_lua  = FAN_WRITE.get(fan_mode, 102)
-        power    = "off" if hvac_mode == "off" else "on"
-        # ptc field cause "réponse vide" — ne pas l'inclure
-        # separate_ptc_mode_switch: entier 1 = PTC standalone (emergency heat)
-        #                           entier 0 = heat pump (normal heat)
-        if hvac_mode == "emergency_heat":
-            control = {
-                "power": "on", "mode": 4,
-                "temperature": float(setpoint_c), "wind_speed": fan_lua,
-                "separate_ptc_mode_switch": 1,
-            }
-        else:
-            control = {
-                "power": power, "mode": mode_lua,
-                "temperature": float(setpoint_c), "wind_speed": fan_lua,
-                "separate_ptc_mode_switch": 0,
-            }
-        result = await self._lua_request("/v1/luacontrol/json2data", {
-            "control": control,
-            "status": "",
-            "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
-        })
-        await self._transparent_send(appliance_id, result["result"])
-
-    async def send_dry_mode(self, appliance_id, duration_min: int,
-                             current_setpoint: float, current_fan: str,
-                             current_hvac_mode: str = "cool"):
-        """Active le dry mode via dry_time_interval + status courant.
-        Le device a besoin du contexte (mode/setpoint/fan) pour savoir où retourner.
-        Confirmé empiriquement : FCM[56]=duration, FCM[57]=remaining countdown.
-        Méthode tirée de l'APK : NATCModel.controlDryTime() + NATCLuaParseHelper.control().
-        Pour désactiver (duration=0) : renvoie le mode précédent via send_control."""
-        if duration_min == 0:
-            await self.send_control(appliance_id, setpoint_c=current_setpoint,
-                                    hvac_mode=current_hvac_mode, fan_mode=current_fan)
-        else:
-            # Flow confirmé depuis l'APK (NATCDehumidificationActivity + NATCModel) :
-            #
-            # 1) controlDryTime(i) → control: {dry_time_interval: i}
-            #    status: generateLuaStatus() = {power, mode(actuel), wind_speed}
-            #    Seuls 3 champs dans le status — pas de temperature
-            #
-            # 2) enableDehumiMode() → controlMode() → control: {power, mode=3, separate_ptc_mode_switch: 0}
-            #    status: generateLuaStatus() APRÈS setModeIndex(3) = {power, mode=3, wind_speed}
-            fan_raw = FAN_WRITE.get(current_fan, 102)
-            current_mode_int = MODE_WRITE.get(current_hvac_mode, 2)
-
-            # Étape 1 : stocker la durée (controlDryTime)
-            status_current = json.dumps({
-                "power": "on",
-                "mode": current_mode_int,
-                "wind_speed": fan_raw,
-            }, separators=(",", ":"))
-            result1 = await self._lua_request("/v1/luacontrol/json2data", {
-                "control": {"dry_time_interval": duration_min},
-                "status":  status_current,
-                "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
-            })
-            try:
-                await self._transparent_send(appliance_id, result1["result"])
-            except RuntimeError as e:
-                if "3176" in str(e):
-                    log.debug("dry_time_interval: pas d'ack (normal)")
-                else:
-                    raise
-
-            # Étape 2 : activer le dry mode (controlMode / enableDehumiMode)
-            # Status avec mode=3 (comme après setModeIndex(3) dans l'APK)
-            status_dry = json.dumps({
-                "power": "on",
-                "mode": 3,
-                "wind_speed": fan_raw,
-            }, separators=(",", ":"))
-            result2 = await self._lua_request("/v1/luacontrol/json2data", {
-                "control": {
-                    "power": "on",
-                    "mode": 3,
-                    "separate_ptc_mode_switch": 0,
-                },
-                "status": status_dry,
-                "deviceinfo": {"deviceSubType": "0x44", "deviceSN": DEVICE_SN},
-            })
-            await self._transparent_send(appliance_id, result2["result"])
-
-    async def close(self):
-        await self._client.aclose()
-
-
-def _decode_state(payload):
-    # payload[16] est une valeur fixe non représentative — température vient du FCM
-    setpoint_c = (payload[22] - 50) / 2
-    power      = payload[17]
-    mode_byte  = payload[21]
-    heat_pump  = payload[18] == 8
-    fan_raw    = payload[23]
-    heating    = bool(payload[85]) if len(payload) > 85 else False
-    # payload[40] bit2 = élément résistif (PTC) physiquement actif
-    # Confirmé empiriquement : [40]=0x34 (serpentin allumé) vs 0x30 (éteint)
-    # Valide pour emergency heat ET le supplément PTC en heat normal (hiver)
-    ptc_active = bool(payload[40] & 0x04) if len(payload) > 40 else False
-
-    if power == 0:
-        hvac_mode = "off"
-        action    = "off"
-    elif mode_byte == 1: hvac_mode = "heat_cool";      action = "heating" if heating else "idle"
-    elif mode_byte == 2: hvac_mode = "cool";            action = "cooling" if heating else "idle"
-    elif mode_byte == 3: hvac_mode = "cool";            action = "cooling" if heating else "idle"
-    elif mode_byte == 4: hvac_mode = "heat";            action = "heating" if heating else "idle"
-    elif mode_byte == 5: hvac_mode = "fan_only";        action = "fan"
-    else:                hvac_mode = "off";             action = "off"
-
-    return {
-        "hvac_mode":    hvac_mode,
-        "action":       action,
-        "aux_heat":     ptc_active,
-        "current_temp": None,
-        "setpoint":     setpoint_c,
-        "fan_mode":     FAN_READ.get(fan_raw, "auto"),
-        "heating":      heating,
-        "mode_byte":    mode_byte,
-    }
-
-
-# ── Bridge MQTT ───────────────────────────────────────────────────────────────
-
-class MoovairMQTTBridge:
-    def __init__(self):
-        self.cloud        = MoovairCloud()
-        self.appliance_id = None
-        self.device_info  = {}
-        self._mqtt        = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1,
-                                        client_id="moovair2mqtt", clean_session=True)
-        self._cmd_queue   = asyncio.Queue()
-        self._last_state  = {}
-        self._running     = True
-        self._loop        = None
-        # ── Données FCM ──────────────────────────────────────────────────────
-        self._fcm_temp         = None   # indoor temp entière (°C, FCM 67-byte[37])
-        self._fcm_temp_precise = None   # indoor temp 0.5°C (FCM 88-byte A1[30]) — à confirmer
-        self._fcm_outdoor_temp = None   # outdoor temp (FCM 88-byte A1[31]) — à confirmer
-        self._fcm_humidity     = None   # indoor humidity % (FCM 67-byte[36]) — à confirmer
-        self._fcm_temp_ts      = None   # monotonic timestamp dernière mise à jour FCM
-        self._fcm_creds        = None
-        self._fcm_client       = None
-        self._user_id          = ""
-        self._dry_mode         = "off"   # état dry mode local (optimiste)
-        self._dry_remain       = 0       # minutes restantes (FCM[57] ou bridge timer)
-        self._dry_timer_task   = None    # asyncio task pour la minuterie dry mode
-        self._pre_dry_mode     = "cool"  # mode HVAC avant activation dry mode
-        self._dry_activated_at = 0.0    # monotonic timestamp de la dernière activation
-        # ── Diagnostics bridge ────────────────────────────────────────────────
-        self._diag_last_update    = None  # timestamp ISO dernière poll réussie
-        self._diag_last_error     = ""    # texte dernière erreur
-        self._diag_consecutive_errors = 0
-
-    def _topic(self, suffix):
-        return f"{CFG['mqtt_prefix']}/{self.appliance_id}/{suffix}"
-
-    def _ha_discovery_topic(self, component, suffix="config"):
-        uid = f"moovair_{self.appliance_id}"
-        return f"homeassistant/{component}/{uid}/{suffix}"
-
-    def _publish_discovery(self):
-        """Publie les payloads MQTT Discovery pour Home Assistant."""
-        dev = {
-            "identifiers": [f"moovair_{self.appliance_id}"],
-            "name":         "Moovair ST-1",
-            "manufacturer": "Moovair / Midea",
-            "model":        "ST-1 Zone Controller",
-        }
-
-        # ── Entité Climate ──────────────────────────────────────────────
-        climate = {
-            "name":                         "Moovair",
-            "unique_id":                    f"moovair_{self.appliance_id}",
-            "device":                       dev,
-            "modes":                        ["off", "heat_cool", "heat", "cool", "fan_only"],
-            "fan_modes":                    ["auto", "low", "medium", "high"],
-            "current_temperature_topic":    self._topic("current_temperature"),
-            "temperature_state_topic":      self._topic("target_temperature"),
-            "mode_state_topic":             self._topic("mode"),
-            "fan_mode_state_topic":         self._topic("fan_mode"),
-            "action_topic":                 self._topic("action"),
-            "temperature_command_topic":    self._topic("set/target_temperature"),
-            "mode_command_topic":           self._topic("set/mode"),
-            "fan_mode_command_topic":       self._topic("set/fan_mode"),
-            "min_temp": 16, "max_temp": 30, "temp_step": 0.5,
-            "temperature_unit":             "C",
-            "availability_topic":           self._topic("availability"),
-            "payload_available":            "online",
-            "payload_not_available":        "offline",
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("climate"),
-            json.dumps(climate), retain=True)
-
-        # ── Aux Heat (résistif 10kW) ─────────────────────────────────────
-        aux_heat = {
-            "name":           "Aux Heat",
-            "unique_id":      f"moovair_{self.appliance_id}_aux_heat",
-            "device":         dev,
-            "state_topic":    self._topic("aux_heat"),
-            "payload_on":     "ON",
-            "payload_off":    "OFF",
-            "icon":           "mdi:heating-coil",
-            "availability_topic": self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("binary_sensor", "aux_heat/config"),
-            json.dumps(aux_heat), retain=True)
-
-        # ── Indoor Humidity ──────────────────────────────────────────────
-        humidity = {
-            "name":                 "Indoor Humidity",
-            "unique_id":            f"moovair_{self.appliance_id}_indoor_humidity",
-            "device":               dev,
-            "state_topic":          self._topic("indoor_humidity"),
-            "unit_of_measurement":  "%",
-            "device_class":         "humidity",
-            "state_class":          "measurement",
-            "icon":                 "mdi:water-percent",
-            "availability_topic":   self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "indoor_humidity/config"),
-            json.dumps(humidity), retain=True)
-
-        # ── Heat Pump Coil Temperature (T4, unité extérieure) ────────────
-        outdoor_temp = {
-            "name":                 "Outdoor Coil Temperature",
-            "unique_id":            f"moovair_{self.appliance_id}_outdoor_temp",
-            "device":               dev,
-            "state_topic":          self._topic("outdoor_temperature"),
-            "unit_of_measurement":  "°C",
-            "device_class":         "temperature",
-            "state_class":          "measurement",
-            "icon":                 "mdi:heat-pump",
-            "availability_topic":   self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "outdoor_temperature/config"),
-            json.dumps(outdoor_temp), retain=True)
-
-        # ── Dry Mode switch (toggle ON/OFF, 30 min, cool/auto uniquement) ──
-        dry_mode = {
-            "name":             "Dry Mode",
-            "unique_id":        f"moovair_{self.appliance_id}_dry_mode",
-            "device":           dev,
-            "state_topic":      self._topic("dry_mode"),
-            "command_topic":    self._topic("set/dry_mode"),
-            "payload_on":       "ON",
-            "payload_off":      "OFF",
-            "state_on":         "ON",
-            "state_off":        "OFF",
-            "icon":             "mdi:air-humidifier",
-            "availability": [
-                {
-                    "topic":                 self._topic("availability"),
-                    "payload_available":     "online",
-                    "payload_not_available": "offline",
-                },
-                {
-                    "topic":                 self._topic("dry_mode_available"),
-                    "payload_available":     "online",
-                    "payload_not_available": "offline",
-                },
-            ],
-            "availability_mode": "all",
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("switch", "dry_mode/config"),
-            json.dumps(dry_mode), retain=True)
-        # Supprimer l'ancienne entité select si elle existait
-        self._mqtt.publish(
-            self._ha_discovery_topic("select", "dry_mode/config"),
-            "", retain=True)
-
-        # ── Heat Pump binary sensor (compresseur unité extérieure actif) ────────
-        heat_pump = {
-            "name":           "Heat Pump",
-            "unique_id":      f"moovair_{self.appliance_id}_heat_pump",
-            "device":         dev,
-            "state_topic":    self._topic("heat_pump"),
-            "payload_on":     "ON",
-            "payload_off":    "OFF",
-            "icon":           "mdi:heat-pump",
-            "availability_topic": self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("binary_sensor", "heat_pump/config"),
-            json.dumps(heat_pump), retain=True)
-        # Supprimer l'ancien switch emergency_heat si présent
-        self._mqtt.publish(
-            self._ha_discovery_topic("switch", "emergency_heat/config"),
-            "", retain=True)
-
-        # ── Suppression des anciens sensors de diagnostic de HA ─────────────
-        # Payload vide = supprime l'entité dans HA (si elle existait)
-        for old in ("last_update/config", "last_error/config",
-                    "consecutive_errors/config", "fcm_status/config"):
-            self._mqtt.publish(
-                self._ha_discovery_topic("sensor", old), "", retain=True)
-        self._mqtt.publish(
-            self._ha_discovery_topic("binary_sensor", "fcm_connected/config"),
-            "", retain=True)
-        # Note: les diagnostics sont toujours publiés sur diag/* (MQTT brut)
-        # pour les développeurs, mais sans entités HA visibles.
-        # ── Dry Mode Remaining (countdown en minutes) ───────────────────────
-        dry_remain = {
-            "name":                 "Dry Mode Remaining",
-            "unique_id":            f"moovair_{self.appliance_id}_dry_remain",
-            "device":               dev,
-            "state_topic":          self._topic("dry_mode_remaining"),
-            "unit_of_measurement":  "min",
-            "state_class":          "measurement",
-            "icon":                 "mdi:timer-outline",
-            "availability_topic":   self._topic("availability"),
-        }
-        self._mqtt.publish(
-            self._ha_discovery_topic("sensor", "dry_remain/config"),
-            json.dumps(dry_remain), retain=True)
-
-        # État initial dry mode (offline = indisponible jusqu'au premier poll)
-        self._mqtt.publish(self._topic("dry_mode"),           "OFF",     retain=True)
-        self._mqtt.publish(self._topic("dry_mode_available"), "offline", retain=True)
-        self._mqtt.publish(self._topic("dry_mode_remaining"), "0",       retain=True)
-        self._mqtt.publish(self._topic("heat_pump"),           "OFF",     retain=True)
-        log.info("MQTT Discovery publiée (climate + aux_heat + humidity + coil temp + dry mode)")
-
-    def _on_fcm_credentials_updated(self, creds):
-        self._fcm_creds = creds
-
-    def _on_fcm_message(self, message, persistent_id, obj):
-        """Callback FCM — extrait température, humidité, outdoor temp des pushes Moovair."""
-        try:
-            parts = message.get('data', {}).get('message', '').split(';')
-            if len(parts) < 3:
-                return
-            msg_type = parts[0].lower()
-            if 'vital' not in msg_type and 'status' not in msg_type:
-                return
-            payload_json = json.loads(parts[2])
-            payload = _fcm_decrypt_push(payload_json.get('msg', ''), self._user_id)
-            if payload is None:
-                return
-
-            self._fcm_temp_ts = time.monotonic()
-            changed = False
-
-            # ── Payload 67 bytes (status condensé, toutes les ~11s) ──────────
-            # byte[37] = indoor temp entière (°C) — confirmé en prod
-            # byte[36] = indoor humidity (%) — à confirmer par l'utilisateur
-            if len(payload) == 67:
-                temp_c = payload[37]
-                if temp_c != self._fcm_temp:
-                    log.info("FCM indoor temp: %s°C", temp_c)
-                    self._fcm_temp = temp_c
-                    changed = True
-
-                humidity = payload[36]
-                if humidity != self._fcm_humidity and 0 < humidity <= 100:
-                    log.info("FCM indoor humidity: %s%%", humidity)
-                    self._fcm_humidity = humidity
-                    changed = True
-
-                # byte[56] = dry_time_interval (durée configurée, minutes)
-                # byte[57] = dry_remain_time (minutes restantes, compte à rebours)
-                # Confirmé empiriquement: 30min→[56]=0x1e,[57]=compte de 30 à 0
-                # Mettre à jour le countdown seulement si dry mode est actif
-                # (le device garde [56]/[57] stockés même en cool mode)
-                if len(payload) > 57 and payload[56] > 0 and self._dry_mode != "OFF":
-                    fcm_remain = payload[57]
-                    if fcm_remain != self._dry_remain:
-                        self._dry_remain = fcm_remain
-                        self._mqtt.publish(self._topic("dry_mode_remaining"),
-                                           str(fcm_remain))
-                        changed = True
-                    # FCM[57]=0 → device a fini le dry mode automatiquement
-                    if fcm_remain == 0:
-                        log.info("FCM: dry mode terminé côté device (remain=0)")
-                        self._dry_mode = "OFF"
-                        if self._dry_timer_task and not self._dry_timer_task.done():
-                            self._dry_timer_task.cancel()
-                        self._mqtt.publish(self._topic("dry_mode"), "OFF")
-
-            # ── Payload 88 bytes, sous-type A1 (byte[17]==161) ───────────────
-            # byte[30] = indoor temp haute précision (formule (byte-50)/2 → 0.5°C)
-            # byte[31] = outdoor temp (même formule)
-            # — À CONFIRMER par l'utilisateur via HA
-            elif len(payload) == 88 and payload[17] == 161:
-                raw_indoor  = payload[30] if len(payload) > 30 else 0
-                raw_outdoor = payload[31] if len(payload) > 31 else 0
-                if raw_indoor > 0:
-                    temp_precise = (raw_indoor - 50) / 2.0
-                    if temp_precise != self._fcm_temp_precise and -20 < temp_precise < 60:
-                        log.info("FCM indoor temp precise: %.1f°C (raw=%d)", temp_precise, raw_indoor)
-                        self._fcm_temp_precise = temp_precise
-                        changed = True
-                if raw_outdoor > 0:
-                    temp_out = (raw_outdoor - 50) / 2.0
-                    if temp_out != self._fcm_outdoor_temp and -40 < temp_out < 60:
-                        log.info("FCM outdoor temp: %.1f°C (raw=%d)", temp_out, raw_outdoor)
-                        self._fcm_outdoor_temp = temp_out
-                        changed = True
-
-            if changed and self._last_state and self._loop:
-                self._loop.call_soon_threadsafe(self._publish_fcm_sensors)
-
-        except Exception as e:
-            log.debug("FCM message parse error: %s", e)
-
-    def _publish_fcm_sensors(self):
-        """Publie les données FCM sur MQTT (appelé depuis le thread FCM)."""
-        if not self.appliance_id:
-            return
-        t = self._topic
-        # Température : utiliser la précision 0.5°C si disponible, sinon entière
-        temp_to_publish = self._fcm_temp_precise if self._fcm_temp_precise is not None else self._fcm_temp
-        if temp_to_publish is not None:
-            self._mqtt.publish(t("current_temperature"), str(temp_to_publish))
-        if self._fcm_humidity is not None:
-            self._mqtt.publish(t("indoor_humidity"), str(self._fcm_humidity))
-        if self._fcm_outdoor_temp is not None:
-            self._mqtt.publish(t("outdoor_temperature"), str(self._fcm_outdoor_temp))
-        # Statut FCM
-        self._mqtt.publish(t("diag/fcm_connected"), "ON")
-
-    async def _fcm_register_token(self, fcm_token):
-        """Enregistre le token FCM auprès du cloud Moovair (utilise la session courante)."""
-        body = {"format": "2", "stamp": _ts(), "language": "en_US", "src": SRC,
-                "sessionId": self.cloud.session_id, "pushToken": fcm_token, "pushType": "5"}
-        body["sign"] = _sign("/v1/user/push/token/update", body)
-        await self.cloud._client.post(f"{BASE_URL}/v1/user/push/token/update", data=body)
-        log.debug("FCM token enregistré avec session %s…", self.cloud.session_id[:8])
-
-    async def _dry_mode_timer(self, duration_min: int, setpoint: float, fan: str):
-        """Timer bridge-side — countdown minute par minute, reset auto à expiration."""
-        try:
-            log.info("Dry mode timer: %d min", duration_min)
-            for remaining in range(duration_min, -1, -1):
-                self._dry_remain = remaining
-                self._mqtt.publish(self._topic("dry_mode_remaining"), str(remaining))
-                if remaining == 0:
-                    break
-                await asyncio.sleep(60)
-            log.info("Dry mode timer expiré — retour en %s", self._pre_dry_mode)
-            await self.cloud.send_control(
-                self.appliance_id, setpoint_c=setpoint,
-                hvac_mode=self._pre_dry_mode, fan_mode=fan)
-            self._dry_mode = "OFF"
-            self._mqtt.publish(self._topic("dry_mode"), "OFF")
-            self._last_state = {}
-        except asyncio.CancelledError:
-            log.debug("Dry mode timer annulé")
-
-    def _fcm_pub_status(self, status: str):
-        """Publie le statut FCM sur MQTT pour diagnostic sans log."""
-        if self.appliance_id:
-            self._mqtt.publish(self._topic("diag/fcm_status"), status)
-            log.info("FCM status: %s", status)
-
-    async def _fcm_loop(self):
-        """Boucle FCM — démarre le listener et reconnecte automatiquement en cas de coupure."""
-        retry_delay = 30
-        attempt = 0
-        while self._running:
-            attempt += 1
-            try:
-                self._fcm_pub_status(f"connecting (attempt {attempt})")
-                fcm_config = FcmRegisterConfig(
-                    project_id=FCM_PROJECT_ID, app_id=FCM_APP_ID,
-                    api_key=FCM_API_KEY, messaging_sender_id=FCM_SENDER_ID,
-                )
-                self._fcm_client = FcmPushClient(
-                    callback=self._on_fcm_message,
-                    fcm_config=fcm_config,
-                    credentials=self._fcm_creds,
-                    credentials_updated_callback=self._on_fcm_credentials_updated,
-                )
-                fcm_token = await self._fcm_client.checkin_or_register()
-                self._fcm_pub_status("token_obtained")
-                await self._fcm_register_token(fcm_token)
-                self._fcm_pub_status("token_registered")
-
-                await self._fcm_client.start()
-                self._fcm_pub_status("listening")
-                log.info("FCM listener démarré — température ambiante live activée")
-                retry_delay = 30
-
-                # Surveiller la connexion FCM jusqu'à ce qu'elle tombe
-                while self._running:
-                    await asyncio.sleep(60)
-                    if not self._fcm_client.is_started():
-                        self._fcm_pub_status("dropped — reconnecting")
-                        log.warning("FCM client arrêté, reconnexion...")
-                        break
-                    if (self._fcm_temp_ts is not None and
-                            time.monotonic() - self._fcm_temp_ts > FCM_MAX_SILENCE):
-                        self._fcm_pub_status(f"silent >{FCM_MAX_SILENCE}s — reconnecting")
-                        log.warning("Pas de push FCM depuis >%ds, reconnexion...", FCM_MAX_SILENCE)
-                        await self._fcm_client.stop()
-                        break
-
-            except Exception as e:
-                msg = str(e)[:120]
-                self._fcm_pub_status(f"error: {msg}")
-                log.warning("FCM échec (%s), retry dans %ds", e, retry_delay)
-
-            if not self._running:
-                break
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 300)
-
-    def _publish_state(self, state):
-        """Publie l'état courant sur les topics MQTT."""
-        # Température : priorité à la précision 0.5°C (A1), fallback entière (67-byte)
-        fcm_fresh = (self._fcm_temp_ts is not None and
-                     time.monotonic() - self._fcm_temp_ts < FCM_TEMP_MAX_AGE)
-        if fcm_fresh:
-            state = dict(state)
-            temp = self._fcm_temp_precise if self._fcm_temp_precise is not None else self._fcm_temp
-            if temp is not None:
-                state["current_temp"] = temp
-
-        if state.get("current_temp") is None:
-            state = dict(state)
-            state.pop("current_temp", None)
-
-        changed = state != self._last_state
-        if not changed:
-            return
-
-        t = self._topic
-        if state.get("current_temp") is not None:
-            self._mqtt.publish(t("current_temperature"), str(state["current_temp"]))
-        self._mqtt.publish(t("target_temperature"),  str(state["setpoint"]))
-        self._mqtt.publish(t("mode"),                state["hvac_mode"])
-        self._mqtt.publish(t("fan_mode"),            state["fan_mode"])
-        self._mqtt.publish(t("action"),              state["action"])
-        self._mqtt.publish(t("aux_heat"),   "ON" if state["aux_heat"] else "OFF")
-        self._mqtt.publish(t("heat_pump"), "ON" if state["heating"] else "OFF")
-        self._mqtt.publish(t("availability"),        "online")
-
-        # Diagnostics bridge
-        now_iso = datetime.now(timezone.utc).isoformat()
-        self._mqtt.publish(t("diag/last_update"),          now_iso)
-        self._mqtt.publish(t("diag/consecutive_errors"),   str(self._diag_consecutive_errors))
-        fcm_ok = fcm_fresh and (self._fcm_client is not None and self._fcm_client.is_started())
-        self._mqtt.publish(t("diag/fcm_connected"),        "ON" if fcm_ok else "OFF")
-        if self._diag_last_error:
-            self._mqtt.publish(t("diag/last_error"),       self._diag_last_error)
-
-        # Sensors FCM (si disponibles)
-        if fcm_fresh:
-            if self._fcm_humidity is not None:
-                self._mqtt.publish(t("indoor_humidity"),   str(self._fcm_humidity))
-            if self._fcm_outdoor_temp is not None:
-                self._mqtt.publish(t("outdoor_temperature"), str(self._fcm_outdoor_temp))
-
-        if self._last_state:
-            changes = {k: v for k, v in state.items() if v != self._last_state.get(k)}
-            if changes:
-                log.info("État mis à jour: %s", changes)
-        else:
-            log.info("Premier état publié: %s", state)
-
-        self._last_state = state.copy()
-
-        # Détecter fin de dry mode via mode_byte (device a quitté mode=3)
-        # Grace period de 90s après activation pour laisser le device changer de mode
-        dry_grace = time.monotonic() - self._dry_activated_at < 90
-        if self._dry_mode != "OFF" and state.get("mode_byte") != 3 and not dry_grace:
-            log.info("Dry mode terminé côté device — reset")
-            self._dry_mode = "OFF"
-            self._dry_remain = 0
-            self._mqtt.publish(self._topic("dry_mode_remaining"), "0")
-            if self._dry_timer_task and not self._dry_timer_task.done():
-                self._dry_timer_task.cancel()
-                self._dry_timer_task = None
-
-        # Dry mode : disponibilité selon le mode HVAC courant
-        dry_ok = state["hvac_mode"] in DRY_MODE_REQUIRES
-        self._mqtt.publish(self._topic("dry_mode_available"),
-                           "online" if dry_ok else "offline")
-        if not dry_ok and self._dry_mode != "OFF":
-            self._dry_mode = "OFF"
-            self._mqtt.publish(self._topic("dry_mode"), "OFF")
-        else:
-            self._mqtt.publish(self._topic("dry_mode"), self._dry_mode)
-
-    def _on_mqtt_message(self, client, userdata, msg):
-        """Callback MQTT — reçoit les commandes de Home Assistant."""
-        topic   = msg.topic
-        payload = msg.payload.decode().strip()
-        prefix  = self._topic("set/")
-
-        if not topic.startswith(prefix):
-            return
-
-        cmd = topic[len(prefix):]
-        log.debug("Commande MQTT reçue: %s = %s", cmd, payload)
-
-        # ── Commande dry mode (gérée séparément, pas via cmd_queue) ──────────
-        if cmd == "dry_mode":
-            if payload not in ("ON", "OFF"):
-                log.warning("Dry mode invalide: %s", payload)
-                return
-            current_mode = self._last_state.get("hvac_mode", "off")
-            if payload == "ON" and current_mode not in DRY_MODE_REQUIRES:
-                log.warning("Dry mode ignoré — mode HVAC actuel: %s", current_mode)
-                return
-            if self._loop:
-                self._loop.call_soon_threadsafe(
-                    self._cmd_queue.put_nowait, {"dry_mode": payload})
-            return
-
-        current = self._last_state.copy()
-        if cmd == "mode":
-            current["hvac_mode"] = payload
-        elif cmd == "target_temperature":
-            try:
-                current["setpoint"] = float(payload)
-            except ValueError:
-                log.warning("Setpoint invalide: %s", payload)
-                return
-        elif cmd == "fan_mode":
-            current["fan_mode"] = payload
-        else:
-            log.warning("Commande inconnue: %s", cmd)
-            return
-
-        if self._loop:
-            self._loop.call_soon_threadsafe(self._cmd_queue.put_nowait, current)
-        else:
-            log.warning("Loop pas encore prête, commande ignorée")
-
-    def _on_mqtt_connect(self, client, userdata, flags, rc):
-        if rc == 0:
-            log.info("MQTT connecté à %s:%s", CFG["mqtt_host"], CFG["mqtt_port"])
-            # Re-abonner aux topics de commande à chaque reconnexion
-            prefix = self._topic("set/")
-            for cmd in ("mode", "target_temperature", "fan_mode", "dry_mode"):
-                self._mqtt.subscribe(f"{prefix}{cmd}")
-                log.debug("Abonné: %s%s", prefix, cmd)
-            # Re-publier "online" après reconnexion (annule le LWT "offline")
-            self._mqtt.publish(self._topic("availability"), "online", retain=True)
-        else:
-            log.error("Connexion MQTT échouée: rc=%s", rc)
-
-    def _on_mqtt_disconnect(self, client, userdata, rc):
-        if rc != 0:
-            log.warning("Déconnexion MQTT inattendue (rc=%s) — reconnexion auto", rc)
-
-    async def _handle_command(self, cmd_state):
-        """Exécute une commande de contrôle reçue de HA."""
-
-        # ── Commande dry mode ────────────────────────────────────────────────
-        if "dry_mode" in cmd_state:
-            activate = cmd_state["dry_mode"] == "ON"
-            duration = DRY_MODE_DURATION if activate else 0
-            setpoint = self._last_state.get("setpoint", 23.0)
-            fan      = self._last_state.get("fan_mode", "auto")
-            log.info("Dry mode: %s", "ON (30 min)" if activate else "OFF")
-            # Annuler le timer existant si présent
-            if self._dry_timer_task and not self._dry_timer_task.done():
-                self._dry_timer_task.cancel()
-                self._dry_timer_task = None
-            # Mise à jour optimiste AVANT l'envoi
-            if activate:
-                self._pre_dry_mode = self._last_state.get("hvac_mode", "cool")
-                self._dry_activated_at = time.monotonic()
-                self._dry_mode = "ON"
+        host = _env("M2M_THERMOSTAT_HOST", "")
+        self.thermostat_host = ""
+        self.thermostat_port = 5555
+        if host:
+            if ":" in host:
+                h, p = host.rsplit(":", 1)
+                self.thermostat_host, self.thermostat_port = h, int(p)
             else:
-                self._dry_remain = 0
-                self._mqtt.publish(self._topic("dry_mode_remaining"), "0")
-                self._dry_mode = "OFF"
-            self._mqtt.publish(self._topic("dry_mode"), self._dry_mode)
+                self.thermostat_host = host
+
+        self.mqtt_host = _env("M2M_MQTT_HOST", "")
+        self.mqtt_port = int(_env("M2M_MQTT_PORT", "1883"))
+        self.mqtt_user = _env("M2M_MQTT_USERNAME")
+        self.mqtt_pass = _env("M2M_MQTT_PASSWORD")
+        self.prefix = _env("M2M_MQTT_TOPIC_PREFIX", "moovair2mqtt")
+        self.discovery_prefix = _env("M2M_HA_DISCOVERY_PREFIX", "homeassistant")
+        self.log_level = _env("M2M_LOG_LEVEL", "info")
+        self.cloud_mode = _env("M2M_CLOUD_MODE", "alongside")  # alongside|local_only
+        # ⚠ Keep this LOW-FREQUENCY. The event stream is the primary path; this
+        # query is only a safety net for missed events. Aggressive polling is a
+        # suspect in the sensor-task wedges observed 2026-08-13/14 (humidity
+        # going --% and the proximity sensor dying until a power cycle), so we
+        # deliberately do not hammer the device. 0 disables it entirely.
+        self.query_interval = float(_env("M2M_QUERY_INTERVAL", "60"))
+        self.heartbeat_timeout = float(_env("M2M_HEARTBEAT_TIMEOUT", "30"))
+        self.msgtool_local = _env("M2M_MSGTOOL_PATH", "/app/msgtool")
+        self.msgtool_remote = "/tmp/msgtool"
+        # Seeds every Home Assistant unique_id, so it must stay STABLE for the
+        # life of the install: change it and HA creates a brand-new set of
+        # entities, orphaning your history, dashboards and automations.
+        #
+        # Default: derived from the thermostat's address. Fine for most people
+        # (give it a fixed IP so it never moves). If you ever do change the
+        # thermostat's IP, set M2M_DEVICE_ID explicitly to the previous value.
+        #
+        # ⚠ Migrating from v2 (the cloud bridge)? Set M2M_DEVICE_ID to your
+        # Midea appliance ID — the value v2 used — and your existing entities
+        # carry straight over instead of being duplicated.
+        self.device_id = (_env("M2M_DEVICE_ID")
+                          or re.sub(r"[^0-9A-Za-z]", "_",
+                                    self.thermostat_host or "unknown"))
+
+    # ── v2 → v3 migration guard ──────────────────────────────────────────
+    def check_legacy(self):
+        legacy = [k for k in ("M2M_MOOVAIR_USERNAME", "M2M_MOOVAIR_PASSWORD")
+                  if os.environ.get(k)]
+        if not self.thermostat_host:
+            bar = "═" * 68
+            print(f"""
+{bar}
+  moovair2mqtt v3 — BREAKING CHANGE
+  This version talks to your thermostat LOCALLY (no cloud, no account).
+
+  {'Detected OLD v2 configuration: ' + ', '.join(legacy) if legacy else 'Missing required configuration.'}
+    M2M_THERMOSTAT_HOST is MISSING and is now REQUIRED.
+
+  What to do:
+    1. Give your thermostat a fixed IP address (your router may call
+       this a DHCP reservation) and note it down
+    2. In docker-compose.yml remove the Moovair account variables and add:
+         M2M_THERMOSTAT_HOST: "192.168.x.x:5555"
+    3. Keep your existing Home Assistant entities by also setting
+         M2M_DEVICE_ID: "<your Midea appliance id>"
+       (without it the entities are recreated and you lose their history)
+    4. docker compose up -d
+
+  Prefer to stay on the cloud version?  Pin the image to  :2.1.0
+  Full guide: https://github.com/saxophone-k/moovair2mqtt/blob/v3.0.0/MIGRATION.md
+{bar}
+""", file=sys.stderr)
+            return False
+        if legacy:
+            LOG.warning("Ignoring v2 cloud variables (%s) — v3 is local-only "
+                        "and needs no Midea account.", ", ".join(legacy))
+        if not self.mqtt_host:
+            print("M2M_MQTT_HOST is required.", file=sys.stderr)
+            return False
+        return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Message builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _envelope(msg_type: int, body: bytes = b"", count: int = 0,
+              body_len: int | None = None) -> bytes:
+    """Build the 1056-byte rac_queue mtext, prefixed with mtype=1 for msgtool."""
+    m = bytearray(MSG_LEN)
+    m[0:4] = struct.pack("<I", 1)              # magic
+    m[4:8] = struct.pack("<I", msg_type)       # ← selects the parser
+    if count:
+        m[9] = count                           # KV entry count
+    if body_len is not None:
+        m[8:12] = struct.pack("<I", body_len)  # TLV frame length
+    m[12:12 + len(body)] = body
+    return struct.pack("<i", 1) + bytes(m)
+
+
+def build_kv(entries) -> bytes:
+    """entries: [(key, value)] — float values are encoded as f32, ints as i32."""
+    body = b""
+    for key, val in entries:
+        body += struct.pack("<I", key)
+        body += struct.pack("<f", val) if isinstance(val, float) else \
+            struct.pack("<i", int(val))
+    return _envelope(TYPE_KV, body, count=len(entries))
+
+
+def build_tlv(tags) -> bytes:
+    """tags: [(tag, value)] in ORDER. 0x71 must come before the mode tag.
+
+    ⚠ Header byte 11 is the **TLV COUNT**, not a constant. Learned by capturing
+    the official app: it sends `02 02 d0 05` for 5 tags and `02 02 d0 02` for 2.
+    We previously hardcoded 0x04 regardless, which was wrong for any frame that
+    did not happen to carry exactly four tags.
+    """
+    header = bytes([0xAA, 0x00, 0x44, 0, 0, 0, 0, 0, 0x02, 0x02, 0xD0, len(tags)])
+    body = b"".join(struct.pack("<I", t) + bytes([1, v & 0xFF]) for t, v in tags)
+    frame = bytearray(header + body + b"\x00\x00" + b"\xB5\xEE\x3C")
+    frame[1] = len(frame) - 1                  # length byte
+    frame = bytes(frame)
+    return _envelope(TYPE_TLV, frame, body_len=len(frame))
+
+
+def build_query() -> bytes:
+    return _envelope(TYPE_QUERY)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADB transport — pure Python, no platform-tools needed
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Device:
+    """
+    TWO independent ADB connections.
+
+    ⚠ A single AdbDeviceTcp cannot serve a long-lived `logread -f` stream AND
+    concurrent shell commands — they share one socket and corrupt each other,
+    which shows up as multi-second command latency. So: one connection owns the
+    read stream, a separate one owns writes.
+    """
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.dev = None          # write/command connection
+        self.rdev = None         # dedicated read-stream connection
+        self._lock = threading.Lock()
+
+    def _new(self):
+        if AdbDeviceTcp is None:
+            raise RuntimeError("adb-shell is not installed (pip install adb-shell)")
+        d = AdbDeviceTcp(self.cfg.thermostat_host, self.cfg.thermostat_port,
+                         default_transport_timeout_s=15.0)
+        d.connect(auth_timeout_s=1.0)
+        return d
+
+    def connect(self):
+        self.dev = self._new()
+        LOG.info("ADB (command channel) connected to %s:%s",
+                 self.cfg.thermostat_host, self.cfg.thermostat_port)
+        self.ensure_msgtool()
+
+    def connect_reader(self):
+        self.rdev = self._new()
+        LOG.info("ADB (read stream) connected")
+        return self.rdev
+
+    def close(self):
+        for attr in ("dev", "rdev"):
             try:
-                await self.cloud.send_dry_mode(self.appliance_id, duration,
-                                               current_setpoint=setpoint,
-                                               current_fan=fan,
-                                               current_hvac_mode=self._pre_dry_mode)
-                log.info("Dry mode appliqué: %s", self._dry_mode)
-                if activate:
-                    self._dry_timer_task = asyncio.ensure_future(
-                        self._dry_mode_timer(duration, setpoint, fan))
-            except Exception as e:
-                log.error("Erreur dry mode: %s", e)
+                d = getattr(self, attr)
+                if d:
+                    d.close()
+            except Exception:
+                pass
+            setattr(self, attr, None)
+
+    def close_reader(self):
+        try:
+            if self.rdev:
+                self.rdev.close()
+        except Exception:
+            pass
+        self.rdev = None
+
+    def close_command(self):
+        try:
+            if self.dev:
+                self.dev.close()
+        except Exception:
+            pass
+        self.dev = None
+
+    def shell(self, cmd, timeout=15.0):
+        with self._lock:
+            return self.dev.shell(cmd, transport_timeout_s=timeout,
+                                  read_timeout_s=timeout)
+
+    def ensure_msgtool(self):
+        """/tmp is volatile — re-push msgtool after every device reboot."""
+        try:
+            out = self.shell(f"[ -x {self.cfg.msgtool_remote} ] && echo ok")
+        except Exception:
+            out = ""
+        if "ok" in (out or ""):
             return
+        if not os.path.exists(self.cfg.msgtool_local):
+            LOG.error("msgtool not found at %s — cannot send commands",
+                      self.cfg.msgtool_local)
+            return
+        LOG.info("Pushing msgtool to the thermostat (%s)", self.cfg.msgtool_remote)
+        with self._lock:
+            self.dev.push(self.cfg.msgtool_local, self.cfg.msgtool_remote)
+        self.shell(f"chmod +x {self.cfg.msgtool_remote}")
 
-        log.info("Exécution commande: mode=%s setpoint=%s fan=%s",
-                 cmd_state.get("hvac_mode"),
-                 cmd_state.get("setpoint"),
-                 cmd_state.get("fan_mode"))
+    def send(self, payload: bytes):
+        self.ensure_msgtool()
+        self.shell(f"{self.cfg.msgtool_remote} send {MSQID} {payload.hex()}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Log parsing — see BRIDGE_NOTES.md "read path"
+# ─────────────────────────────────────────────────────────────────────────────
+
+RE_AHU3_A = re.compile(
+    r"RAC_DEV_AHU3_STATE, power: (\d+), mode: (\d+).*?temp_unit =(\d+), "
+    r"temp_set: ([\d.]+), wind_speed: (\d+)")
+RE_AHU3_B = re.compile(
+    r"RAC_DEV_AHU3_STATE, fan_state: (\d+).*?elec_heat: (\d+), "
+    r"elec_heat_only:(\d+), compressor_state =(\d+)")
+# ⚠ Use the COMPENSATED values meiju reports — these are what the PANEL shows.
+# `get_dev_sensor_data f_temp` is the RAW sensor and reads ~2 °C high; publishing
+# it made HA disagree with the thermostat's own display (caught 2026-08-14).
+# ⚠ `AHU3_STATE ... temp_set:` TRUNCATES to whole degrees (21.5 -> 21.0), but
+# the device really does support 0.5 steps. `setTemp .Ts =` carries the true
+# value, so prefer it. Verified 2026-08-14: KV setpoint 21.5 -> setTemp 21.5
+# while AHU3_STATE reported 21.0. (TLV tag 3 truncates too — use KV for
+# setpoints.)
+RE_SETTEMP = re.compile(r"setTemp .*?\.Ts = ([\d.]+)")
+RE_SENSOR_MEIJU = re.compile(r"temp_val (\d+),\s*humi_val (\d+)")
+# Raw sensor: used ONLY as a liveness heartbeat, never published.
+RE_SENSOR_RAW = re.compile(r"f_temp = ([\d.]+)\s+sensor->humi_val = ([\d.]+)")
+# NOTE: the countdown appears on TWO lines with DIFFERENT separators — the
+# per-minute tick is on the meiju "notify" line which uses '='. Parse both.
+RE_DEHUM = re.compile(r"dehum_time_left[:=](\d+), dehum_interval[:=](\d+)")
+RE_UI = re.compile(
+    r"heating_max=(\d+),\s+cooling_min=(\d+).*?aux_heat_open=(\d+).*?"
+    r"comm_mode=(\d+).*?available_mode:([0-9a-fA-F]+)")
+# `msmart_cmd_ctrl` logs this on every change — from HA, the app, or the panel —
+# which is our only read-back for freeze protection (it is not in AHU3_STATE).
+RE_FREEZE = re.compile(r"msmart set degree8Heat=(\d)")
+RE_UART_C0 = re.compile(r"^\[aa c0 ((?:[0-9a-f]{2} )+)")
+
+
+def f2c(f):
+    return (f - 32.0) * 5.0 / 9.0
+
+
+class State:
+    """Everything we know. `dirty` marks fields changed since last publish."""
+
+    def __init__(self):
+        self.power = None
+        self.mode = None
+        self.setpoint = None
+        self.fan = None
+        self.fan_state = None
+        self.elec_heat = None
+        self.elec_heat_only = None
+        self.compressor = None
+        self.indoor_temp = None
+        self.indoor_humidity = None
+        self.humidity_fault = False
+        self.coil_indoor = None       # T2A
+        self.coil_outdoor = None      # T3
+        self.board_indoor_temp = None  # T1 (board's own sensor)
+        self.temp_unit = None          # 0 = C, 1 = F  (AHU3 `temp_unit`)
+        self.freeze = False            # 8 C freeze protection
+        self.dry_remaining = None
+        self.dry_interval = None
+        # capabilities (self-configuration)
+        self.heating_max = None
+        self.cooling_min = None
+        self.aux_heat_open = None
+        self.comm_mode = None
+        self.available_mode = None
+        self.last_seen = 0.0
+        self.dirty = set()
+
+    def set(self, field, value):
+        # NOTE: None is a meaningful value for fields that can go "unavailable"
+        # (e.g. indoor_humidity during the meiju 255 fault), so it is allowed.
+        if value is None and field not in ("indoor_humidity",):
+            return
+        if getattr(self, field) != value:
+            setattr(self, field, value)
+            self.dirty.add(field)
+
+    # ── derived ──────────────────────────────────────────────────────────
+    @property
+    def hvac_mode(self):
+        if self.power == 0:
+            return "off"                     # off is POWER, not a mode value
+        return HVAC_FROM_MODE.get(self.mode)
+
+    @property
+    def hvac_action(self):
+        if self.power == 0:
+            return "off"
+        if self.elec_heat or (self.mode == MODE_HEAT and self.compressor):
+            return "heating"
+        if self.compressor and self.mode in (MODE_COOL, MODE_DRY):
+            return "cooling"
+        if self.mode == MODE_AUTO and self.compressor:
+            return "cooling"                 # refined by four_valve if decoded
+        if self.fan_state:
+            return "fan"
+        return "idle"
+
+    @property
+    def dry_active(self):
+        return self.mode == MODE_DRY
+
+    @property
+    def preset(self):
+        return PRESET_EMERGENCY if self.elec_heat_only else PRESET_NORMAL
+
+
+def parse_line(line: str, st: State):
+    m = RE_SETTEMP.search(line)
+    if m:
+        st.set("setpoint", float(m.group(1)))     # authoritative, keeps 0.5
+        st.last_seen = time.time()
+        return
+    m = RE_AHU3_A.search(line)
+    if m:
+        st.set("power", int(m.group(1)))
+        st.set("mode", int(m.group(2)))
+        st.set("temp_unit", int(m.group(3)))
+        sp = float(m.group(4))
+        # Only accept the truncated value if it disagrees by a whole degree —
+        # otherwise it would clobber a known .5 with its rounded self.
+        if st.setpoint is None or abs(st.setpoint - sp) >= 1.0:
+            st.set("setpoint", sp)
+        st.set("fan", int(m.group(5)))
+        st.last_seen = time.time()
+        return
+    m = RE_AHU3_B.search(line)
+    if m:
+        st.set("fan_state", int(m.group(1)))
+        st.set("elec_heat", int(m.group(2)))
+        st.set("elec_heat_only", int(m.group(3)))
+        st.set("compressor", int(m.group(4)))
+        return
+    m = RE_SENSOR_MEIJU.search(line)
+    if m:
+        st.set("indoor_temp", int(m.group(1)) / 100.0)   # 2300 → 23.0 °C
+        hum = int(m.group(2))
+        # 255 = 0xFF = meiju's "invalid" sentinel. Known vendor bug: the sensor
+        # reads fine but meiju publishes 255, and the panel shows "--%".
+        # Recovery is `killall meiju`. See DEVICE_FAULTS.md. Report it as
+        # unavailable rather than publishing a bogus 255 % into HA history.
+        st.set("humidity_fault", hum == 255)
+        st.set("indoor_humidity", None if hum == 255 else hum)
+        st.last_seen = time.time()
+        return
+    m = RE_SENSOR_RAW.search(line)
+    if m:
+        st.last_seen = time.time()           # ~1/s → liveness heartbeat only
+        return
+    m = RE_DEHUM.search(line)
+    if m:
+        st.set("dry_remaining", int(m.group(1)))
+        st.set("dry_interval", int(m.group(2)))
+        return
+    m = RE_UI.search(line)
+    if m:
+        st.set("heating_max", int(m.group(1)))
+        st.set("cooling_min", int(m.group(2)))
+        st.set("aux_heat_open", int(m.group(3)))
+        st.set("comm_mode", int(m.group(4)))
+        st.set("available_mode", int(m.group(5), 16))
+        return
+    m = RE_FREEZE.search(line)
+    if m:
+        st.set("freeze", m.group(1) == "1")
+        return
+    m = RE_UART_C0.search(line)
+    if m:
+        # group(1) begins AFTER "[aa c0 ", so b[i] == frame byte (i + 2).
+        b = [int(x, 16) for x in m.group(1).split()]
+        if len(b) >= 13:                       # need frame[14] → b[12]
+            st.set("board_indoor_temp", b[11 - 2] - TEMP_OFFSET)  # T1  frame[11]
+            st.set("coil_indoor", b[12 - 2] - TEMP_OFFSET)        # T2A frame[12]
+            st.set("coil_outdoor", b[14 - 2] - TEMP_OFFSET)       # T3  frame[14]
+        return
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MQTT / Home Assistant
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Bridge:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.state = State()
+        # Guards `state` against torn reads. The reader thread rewrites these
+        # fields continuously while the command thread assembles frames from
+        # them; see `_full_tlv` for why a half-updated snapshot is dangerous.
+        # (Device._lock is unrelated — that one serialises ADB sends.)
+        self._state_lock = threading.Lock()
+        self.device = Device(cfg)
+        self.cmd_q: queue.Queue = queue.Queue()
+        self.mqtt = None
+        self._discovery_done = False
+        self._stop = threading.Event()
+        self._device_online = None      # None = unknown yet
+        self._pending = {}              # field -> (value, sent_at) for latency
+
+    # ── topics ───────────────────────────────────────────────────────────
+    def t(self, leaf):
+        return f"{self.cfg.prefix}/{leaf}"
+
+    def disc(self, component, obj):
+        return (f"{self.cfg.discovery_prefix}/{component}/"
+                f"moovair_{self.cfg.device_id}/{obj}/config")
+
+    # ── MQTT plumbing ────────────────────────────────────────────────────
+    def start_mqtt(self):
         try:
-            # 1) Mise à jour OPTIMISTE: publier la commande immédiatement dans HA
-            #    sans attendre la confirmation du device. HA met à jour instantanément.
-            optimistic = self._last_state.copy()
-            optimistic.update({
-                "hvac_mode": cmd_state["hvac_mode"],
-                "setpoint":  cmd_state["setpoint"],
-                "fan_mode":  cmd_state["fan_mode"],
-                "action":    "off" if cmd_state["hvac_mode"] == "off" else optimistic.get("action", "idle"),
-            })
-            self._last_state = {}           # forcer la publication même si identique
-            self._publish_state(optimistic)
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                 client_id="moovair-local")
+        except (AttributeError, TypeError):       # paho 1.x
+            client = mqtt.Client(client_id="moovair-local")
+        if self.cfg.mqtt_user:
+            client.username_pw_set(self.cfg.mqtt_user, self.cfg.mqtt_pass or "")
+        client.will_set(self.t("availability"), "offline", retain=True)
+        client.on_connect = self._on_connect
+        client.on_message = self._on_message
+        client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, 60)
+        client.loop_start()
+        self.mqtt = client
 
-            # 2) Envoyer la vraie commande au cloud
-            await self.cloud.send_control(
-                self.appliance_id,
-                setpoint_c = cmd_state["setpoint"],
-                hvac_mode  = cmd_state["hvac_mode"],
-                fan_mode   = cmd_state["fan_mode"],
-            )
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        LOG.info("MQTT connected to %s:%s", self.cfg.mqtt_host, self.cfg.mqtt_port)
+        client.subscribe(self.t("set/#"))
+        if self._device_online:
+            client.publish(self.t("availability"), "online", retain=True)
+        self._discovery_done = False
 
-            # 3) Attendre que le device applique, puis lire l'état réel
-            await asyncio.sleep(5)
-            self._last_state = {}           # forcer re-publication de l'état réel
-            state = await self.cloud.read_state(self.appliance_id)
-            self._publish_state(state)
+    def _on_message(self, client, userdata, msg):
+        leaf = msg.topic.split("/set/", 1)[-1]
+        payload = msg.payload.decode(errors="replace").strip()
+        LOG.info("command: %s = %s", leaf, payload)
+        self.cmd_q.put((leaf, payload))
 
-        except Exception as e:
-            log.error("Erreur commande: %s", e)
-            if "session" in str(e).lower() or "invalid" in str(e).lower():
-                await self._relogin()
+    def set_device_online(self, online: bool, why: str = ""):
+        """Availability must reflect the THERMOSTAT, not just the bridge.
+        The MQTT will only covers the bridge dying; if the device goes away
+        (power cut, WiFi drop) we must publish 'offline' ourselves."""
+        if self._device_online == online:
+            return
+        self._device_online = online
+        if self.mqtt and self.mqtt.is_connected():
+            self.mqtt.publish(self.t("availability"),
+                              "online" if online else "offline", retain=True)
+        LOG.warning("thermostat %s%s", "ONLINE" if online else "OFFLINE",
+                    f" ({why})" if why else "")
 
-    async def _relogin(self):
-        """Re-login en cas d'expiration de session."""
-        log.info("Re-login en cours...")
+    def pub(self, leaf, value, retain=True):
+        if value is None:
+            return
+        self.mqtt.publish(self.t(leaf), str(value), retain=retain)
+
+    # ── HA discovery (self-configuring) ──────────────────────────────────
+    def publish_discovery(self):
+        st = self.state
+        dev = {
+            "identifiers": [f"moovair_{self.cfg.device_id}"],
+            "name": "Moovair ST-1",
+            "manufacturer": "Moovair / Midea",
+            "model": "ST-1 Zone Controller (local)",
+        }
+        avail = {"availability_topic": self.t("availability"),
+                 "payload_available": "online",
+                 "payload_not_available": "offline"}
+
+        modes = ["off"]
+        for m, name in HVAC_FROM_MODE.items():
+            if m == MODE_DRY:
+                continue                       # Option B — dry is not an HA mode
+            if st.available_mode is None or \
+               st.available_mode & AVAILABLE_MODE_BITS.get(m, 0):
+                if name not in modes:
+                    modes.append(name)
+
+        climate = {
+            "name": "Moovair", "unique_id": f"moovair_{self.cfg.device_id}",
+            "device": dev, **avail,
+            "modes": modes,
+            "fan_modes": ["auto", "low", "medium", "high"],
+            "preset_modes": [PRESET_NORMAL, PRESET_EMERGENCY],
+            "current_temperature_topic": self.t("current_temperature"),
+            "temperature_state_topic": self.t("target_temperature"),
+            "mode_state_topic": self.t("mode"),
+            "fan_mode_state_topic": self.t("fan_mode"),
+            "preset_mode_state_topic": self.t("preset"),
+            "action_topic": self.t("action"),
+            "temperature_command_topic": self.t("set/target_temperature"),
+            "mode_command_topic": self.t("set/mode"),
+            "fan_mode_command_topic": self.t("set/fan_mode"),
+            "preset_mode_command_topic": self.t("set/preset"),
+            "min_temp": st.cooling_min if st.cooling_min else 16,
+            "max_temp": st.heating_max if st.heating_max else 30,
+            "temp_step": 1.0,
+            # follow the device (AHU3 `temp_unit`, tag 0x47: 0=C, 1=F).
+            # Verified 2026-08-15: switched to °F at the panel and HA followed.
+            "temperature_unit": "F" if st.temp_unit else "C",
+        }
+        self.mqtt.publish(self.disc("climate", "climate"), json.dumps(climate),
+                          retain=True)
+
+        def sensor(obj, name, topic, unit=None, dclass=None, icon=None):
+            cfg = {"name": name, "unique_id": f"moovair_{self.cfg.device_id}_{obj}",
+                   "device": dev, **avail, "state_topic": self.t(topic)}
+            if unit:
+                cfg["unit_of_measurement"] = unit
+            if dclass:
+                cfg["device_class"] = dclass
+            if icon:
+                cfg["icon"] = icon
+            self.mqtt.publish(self.disc("sensor", obj), json.dumps(cfg), retain=True)
+
+        def binary(obj, name, topic, icon):
+            cfg = {"name": name, "unique_id": f"moovair_{self.cfg.device_id}_{obj}",
+                   "device": dev, **avail, "state_topic": self.t(topic),
+                   "payload_on": "ON", "payload_off": "OFF", "icon": icon}
+            self.mqtt.publish(self.disc("binary_sensor", obj), json.dumps(cfg),
+                              retain=True)
+
+        sensor("indoor_humidity", "Indoor Humidity", "indoor_humidity", "%",
+               "humidity")
+        sensor("outdoor_temp", "Outdoor Coil Temperature", "outdoor_temperature",
+               "°C", "temperature")
+        sensor("indoor_coil_temp", "Indoor Coil Temperature", "indoor_coil_temperature",
+               "°C", "temperature")
+        sensor("dry_remain", "Dry Mode Remaining", "dry_mode_remaining", "min",
+               icon="mdi:timer-sand")
+        binary("aux_heat", "Aux Heat", "aux_heat", "mdi:heating-coil")
+        binary("heat_pump", "Heat Pump", "heat_pump", "mdi:heat-pump")
+
+        # Dry mode: button + duration, mirroring the panel (Option B)
+        num = {"name": "Dry Duration",
+               "unique_id": f"moovair_{self.cfg.device_id}_dry_duration",
+               "device": dev, **avail,
+               "state_topic": self.t("dry_duration"),
+               "command_topic": self.t("set/dry_duration"),
+               "min": 5, "max": 120, "step": 1,
+               "unit_of_measurement": "min", "icon": "mdi:water-percent"}
+        self.mqtt.publish(self.disc("number", "dry_duration"), json.dumps(num),
+                          retain=True)
+
+        frz = {"name": "Freeze Protection",
+               "unique_id": f"moovair_{self.cfg.device_id}_freeze",
+               "device": dev, **avail,
+               "state_topic": self.t("freeze_protection"),
+               "command_topic": self.t("set/freeze_protection"),
+               "payload_on": "ON", "payload_off": "OFF",
+               "icon": "mdi:snowflake-alert"}
+        self.mqtt.publish(self.disc("switch", "freeze_protection"),
+                          json.dumps(frz), retain=True)
+
+        sw = {"name": "Dry Mode",
+              "unique_id": f"moovair_{self.cfg.device_id}_dry_mode",
+              "device": dev, **avail,
+              "state_topic": self.t("dry_mode"),
+              "command_topic": self.t("set/dry_mode"),
+              "payload_on": "ON", "payload_off": "OFF",
+              "icon": "mdi:water-percent"}
+        self.mqtt.publish(self.disc("switch", "dry_mode"), json.dumps(sw),
+                          retain=True)
+
+        LOG.info("HA discovery published (modes=%s, range=%s-%s)", modes,
+                 climate["min_temp"], climate["max_temp"])
+        self._discovery_done = True
+
+    # ── publish state ────────────────────────────────────────────────────
+    def _confirm(self):
+        """Log the round-trip: MQTT command -> device state actually changed."""
+        st = self.state
+        for leaf, (want, sent) in list(self._pending.items()):
+            got = None
+            if leaf == "mode":
+                got = st.hvac_mode
+            elif leaf == "target_temperature":
+                got = str(st.setpoint)
+                want = str(float(want))
+            elif leaf == "fan_mode":
+                got = FAN_FROM_IDX.get(st.fan)
+            elif leaf == "preset":
+                got = st.preset
+                if want in ("none", "None", ""):
+                    want = PRESET_NORMAL
+            elif leaf == "dry_mode":
+                got = "ON" if st.dry_active else "OFF"
+                want = str(want).upper()
+            if got is not None and str(got) == str(want):
+                LOG.info("✓ device confirmed %s=%s after %.0f ms", leaf, want,
+                         (time.time() - sent) * 1000)
+                self._pending.pop(leaf, None)
+            elif time.time() - sent > 20:
+                LOG.warning("✗ device did NOT confirm %s=%s within 20s "
+                            "(device reports %s)", leaf, want, got)
+                self._pending.pop(leaf, None)
+
+    def publish_state(self, force=False):
+        st = self.state
+        self._confirm()
+        if not force and not st.dirty:
+            return
+        if st.hvac_mode:
+            self.pub("mode", st.hvac_mode)
+            self.pub("action", st.hvac_action)
+        if st.setpoint is not None:
+            self.pub("target_temperature", st.setpoint)
+        if st.fan is not None:
+            self.pub("fan_mode", FAN_FROM_IDX.get(st.fan, "auto"))
+        self.pub("preset", st.preset)
+        self.pub("current_temperature", st.indoor_temp)
+        self.pub("indoor_humidity",
+                 "unavailable" if st.humidity_fault else st.indoor_humidity)
+        self.pub("outdoor_temperature", st.coil_outdoor)
+        self.pub("indoor_coil_temperature", st.coil_indoor)
+        self.pub("dry_mode", "ON" if st.dry_active else "OFF")
+        self.pub("freeze_protection", "ON" if st.freeze else "OFF")
+        self.pub("dry_mode_remaining", st.dry_remaining)
+        self.pub("dry_duration", st.dry_interval)
+        if st.elec_heat is not None:
+            self.pub("aux_heat", "ON" if st.elec_heat else "OFF")
+        if st.compressor is not None:
+            self.pub("heat_pump", "ON" if st.compressor else "OFF")
+        st.dirty.clear()
+
+    # ── command handling ─────────────────────────────────────────────────
+    def _full_tlv(self, **over):
+        """Channel A frames are sent complete — proven safe. Order matters.
+
+        ⚠ Every frame carries power + setpoint + fan + mode, so the three fields
+        the caller did NOT set are filled in from current state. Reading them
+        one at a time lets the reader thread change state mid-read, producing a
+        frame that mixes two different moments — e.g. a new setpoint sent
+        alongside a stale mode, snapping the thermostat back to where it was.
+        The window is microseconds and has never been observed, but the failure
+        would be silent and baffling, so take ONE consistent snapshot instead.
+        """
+        with self._state_lock:
+            cur_power = self.state.power
+            cur_setpoint = self.state.setpoint
+            cur_fan = self.state.fan
+            cur_mode = self.state.mode
+
+        if "power" in over:
+            power = over["power"]
+        elif cur_power is None:
+            power = 0x03                     # state unknown yet — assume on
+        else:
+            # ⚠ Must PRESERVE the current power state. `st.power or 1` was always
+            # truthy, so changing the setpoint or fan while the unit was OFF
+            # silently switched it ON. Only reachable once core controls moved to
+            # Channel A (2026-08-14).
+            power = 0x03 if cur_power else 0x00
+        sp = over.get("setpoint", cur_setpoint or 22.0)
+        fan = over.get("fan", cur_fan if cur_fan is not None else 3)
+        mode = over.get("mode", cur_mode or MODE_COOL)
+        tags = [(TLV_POWER, power),
+                (TLV_SETPOINT, int(round(sp * 2 + 50))),
+                (TLV_FAN, FAN_TLV.get(fan, 0x66))]
+        if "dehum" in over:                      # MUST precede the mode tag
+            tags.append((TLV_DEHUM_INTERVAL, over["dehum"]))
+        tags.append((TLV_MODE, mode))
+        return build_tlv(tags)
+
+    def _ui_repaint(self):
+        """Force meiju to redraw the thermostat's screen.
+
+        KV (Channel B) commands do NOT call `rac_dev_notify_ui_state_update`, so
+        anything sent only over KV — emergency heat (31), dry entry — is applied
+        by the system but never shown on the panel. A **no-op Channel A frame**
+        (current power/mode/setpoint/fan) does notify, so it repaints without
+        changing anything. Observed 2026-08-14: preset changes didn't show until
+        a mode command happened to follow.
+        """
         try:
-            await self.cloud.login()
-            # Re-enregistrer le token FCM avec la nouvelle session
-            if self._fcm_client is not None:
+            time.sleep(0.3)
+            self.device.send(self._full_tlv())
+        except Exception as exc:
+            LOG.debug("ui repaint failed: %s", exc)
+
+    def handle_command(self, leaf, payload):
+        """
+        ⚠ CHANNEL CHOICE MATTERS FOR THE THERMOSTAT'S OWN SCREEN.
+
+        `rac_dev_kv_parse` (Channel B) does NOT call
+        `rac_dev_notify_ui_state_update`, so meiju — which paints the panel —
+        never learns about the change and the display stays stale until the
+        compressor cycles (a board frame, which does notify).
+        `msmart_cmd_ctrl` (Channel A, the `aa` TLV frame) DOES notify.
+
+        So: power / mode / setpoint / fan go over **Channel A**.
+        Channel B is used only where there is no TLV equivalent
+        (emergency heat = KV 31) or where TLV proved unreliable (dry entry).
+        Diagnosed 2026-08-14 after noticing the panel only refreshed on
+        compressor state changes.
+        """
+        st = self.state
+
+        if leaf == "mode":
+            if payload == "off":
+                self.device.send(self._full_tlv(power=0x00))
+                return
+            mode = MODE_FROM_HVAC.get(payload)
+            if mode is None:
+                LOG.warning("unknown mode %r", payload)
+                return
+            # leaving heat clears emergency, exactly as the app does
+            if st.elec_heat_only and mode != MODE_HEAT:
+                self.device.send(build_kv([(KV_EMERGENCY, 0)]))
+            self.device.send(self._full_tlv(power=0x03, mode=mode))
+
+        elif leaf == "target_temperature":
+            # whole degrees only — the panel and the Moovair app cannot
+            # display halves, even though dev_app accepts them internally.
+            sp = int(round(float(payload)))
+            self.device.send(self._full_tlv(setpoint=sp))
+
+        elif leaf == "fan_mode":
+            idx = FAN_TO_IDX.get(payload)
+            if idx is None:
+                return
+            if st.mode == MODE_AUTO:
+                LOG.info("Auto mode forces the fan to auto — the device will "
+                         "override this request (known behaviour).")
+            self.device.send(self._full_tlv(fan=idx))
+
+        elif leaf == "preset":
+            # Replay the OFFICIAL APP's frame (captured 2026-08-14). KV key 31
+            # also sets the flag, but it does not notify meiju so the panel
+            # stays stale; this path goes through `msmart_cmd_ctrl`, which does.
+            emerg = (payload == PRESET_EMERGENCY)
+            # Emergency implies heat. Leaving it must NOT drag the user out of
+            # whatever mode they are in, so reuse the current mode.
+            mode = MODE_HEAT if emerg else (st.mode or MODE_HEAT)
+            power = 0x03 if (st.power is None or st.power) else 0x00
+            self.device.send(build_tlv([
+                (TLV_MODE, mode),
+                (TLV_AUX_41, 2),
+                (TLV_EMERGENCY, 3 if emerg else 2),
+                (TLV_POWER, power),
+                (TLV_PTC, 0x0A if emerg else 0x0B),
+            ]))
+
+        elif leaf == "freeze_protection":
+            # Captured from the app: tag 0x41, 3 = on / 2 = off. Freeze
+            # protection drives the unit to 8 C, so the app also restores the
+            # real setpoint when switching it OFF — we do the same.
+            on = payload.upper() in ("ON", "1", "TRUE")
+            if on:
+                self._freeze_restore = st.setpoint
+                self.device.send(build_tlv([(TLV_FREEZE, 3)]))
+            else:
+                tags = [(TLV_FREEZE, 2)]
+                back = getattr(self, "_freeze_restore", None) or st.setpoint
+                if back:
+                    tags.append((TLV_SETPOINT, int(round(back * 2 + 50))))
+                self.device.send(build_tlv(tags))
+
+        elif leaf == "dry_duration":
+            minutes = max(1, min(255, int(float(payload))))
+            self.device.send(self._full_tlv(dehum=minutes))
+
+        elif leaf == "dry_mode":
+            if payload.upper() == "ON":
+                if st.mode not in (MODE_COOL, MODE_DRY):
+                    LOG.info("Dry requires cool mode — switching to cool first.")
+                    self.device.send(self._full_tlv(mode=MODE_COOL))
+                    time.sleep(1.0)
+                if st.dry_interval:
+                    self.device.send(self._full_tlv(dehum=st.dry_interval))
+                    time.sleep(0.5)
+                # TLV mode->dry proved unreliable; KV is the dependable route in
+                self.device.send(build_kv([(KV_MODE, MODE_DRY)]))
+                self._ui_repaint()
+            else:
+                self.device.send(self._full_tlv(mode=MODE_COOL))
+                if st.dry_interval:
+                    time.sleep(0.5)
+                    self.device.send(self._full_tlv(dehum=st.dry_interval))
+        else:
+            LOG.warning("unhandled command topic %r", leaf)
+
+    # ── main loops ───────────────────────────────────────────────────────
+    def reader_loop(self):
+        """Tail logread on its OWN connection; reconnect on failure."""
+        while not self._stop.is_set():
+            try:
+                rdev = self.device.connect_reader()
+                LOG.info("tailing logread")
+                for chunk in rdev.streaming_shell("logread -f",
+                                                  transport_timeout_s=None):
+                    if self._stop.is_set():
+                        break
+                    # One acquire per chunk, not per line: `logread` delivers
+                    # ~200 lines/s and parse_line only mutates state (it cannot
+                    # publish or block), so holding it across the chunk is cheap
+                    # and keeps the command thread from seeing a partial update.
+                    with self._state_lock:
+                        for line in chunk.splitlines():
+                            parse_line(line, self.state)
+                    if chunk:
+                        self.set_device_online(True, "log stream active")
+            except Exception as exc:
+                LOG.warning("read stream lost (%s) — reconnecting in 5s", exc)
+                self.set_device_online(False, "read stream lost")
+                self.device.close_reader()
+                self._stop.wait(5)
+
+    def _ensure_command_channel(self):
+        """The write connection is separate from the read stream and must be
+        established (and re-established) independently."""
+        if self.device.dev is not None:
+            return True
+        try:
+            self.device.connect()
+            self.device.send(build_query())          # resync on (re)connect
+            return True
+        except Exception as exc:
+            LOG.warning("command channel unavailable (%s)", exc)
+            self.device.dev = None
+            return False
+
+    def worker_loop(self):
+        last_query = 0.0
+        last_conn_try = 0.0
+        while not self._stop.is_set():
+            now = time.time()
+            if self.device.dev is None and now - last_conn_try >= 5:
+                last_conn_try = now
+                self._ensure_command_channel()
+
+            # commands first — responsiveness matters
+            try:
+                leaf, payload = self.cmd_q.get(timeout=0.2)
                 try:
-                    fcm_token = await self._fcm_client.checkin_or_register()
-                    await self._fcm_register_token(fcm_token)
-                    log.info("FCM token re-enregistré après re-login")
-                except Exception as fe:
-                    log.warning("Re-enregistrement FCM échoué: %s", fe)
-        except Exception as e:
-            log.error("Re-login échoué: %s", e)
-            self._mqtt.publish(self._topic("availability"), "offline")
+                    if not self._ensure_command_channel():
+                        raise RuntimeError("no command channel")
+                    t0 = time.time()
+                    self.handle_command(leaf, payload)
+                    LOG.info("command %s=%s injected in %.0f ms", leaf, payload,
+                             (time.time() - t0) * 1000)
+                    self._pending[leaf] = (payload, time.time())
+                except Exception as exc:
+                    LOG.error("command %s failed: %s", leaf, exc)
+                    self.device.close_command()      # force a fresh connection
+            except queue.Empty:
+                pass
 
-    async def run(self):
-        """Boucle principale du bridge."""
-        # Capturer le loop asyncio pour les callbacks paho-mqtt (thread séparé)
-        self._loop = asyncio.get_running_loop()
+            now = time.time()
+            if self.state.last_seen and \
+                    now - self.state.last_seen > self.cfg.heartbeat_timeout:
+                LOG.warning("no sensor data for %.0fs — the log stream looks "
+                            "dead; forcing reconnect",
+                            now - self.state.last_seen)
+                self.set_device_online(False, "no sensor data")
+                self.state.last_seen = 0
+                self.device.close()
 
-        # Login cloud
-        await self.cloud.login()
-        self.appliance_id, self.device_info = await self.cloud.get_appliance_id()
-        self._user_id = self.cloud.user_id
-
-        # Démarrer la boucle FCM (température ambiante live, reconnexion automatique)
-        asyncio.ensure_future(self._fcm_loop())
-
-        # Connexion MQTT
-        self._mqtt.on_connect    = self._on_mqtt_connect
-        self._mqtt.on_disconnect = self._on_mqtt_disconnect
-        self._mqtt.on_message    = self._on_mqtt_message
-        if CFG["mqtt_user"]:
-            self._mqtt.username_pw_set(CFG["mqtt_user"], CFG["mqtt_pass"])
-        self._mqtt.will_set(self._topic("availability"), "offline", retain=True)
-        self._mqtt.reconnect_delay_set(min_delay=5, max_delay=30)
-        self._mqtt.connect(CFG["mqtt_host"], CFG["mqtt_port"], keepalive=60)
-        self._mqtt.loop_start()
-
-        await asyncio.sleep(2)  # Laisser MQTT se connecter
-        self._publish_discovery()
-
-        log.info("Bridge démarré — poll toutes les %ss", CFG["poll_interval"])
-        poll_interval = CFG["poll_interval"]
-        last_poll     = 0
-
-        while self._running:
-            # Traiter les commandes en attente
-            while not self._cmd_queue.empty():
-                cmd = await self._cmd_queue.get()
-                await self._handle_command(cmd)
-                last_poll = 0
-
-            # Poll périodique
-            now = time.monotonic()
-            if now - last_poll >= poll_interval:
+            if self.cfg.query_interval > 0 and self.device.dev and \
+                    now - last_query >= self.cfg.query_interval:
+                last_query = now
                 try:
-                    state = await self.cloud.read_state(self.appliance_id)
-                    self._publish_state(state)
-                    self._mqtt.publish(self._topic("availability"), "online", retain=True)
-                    self._diag_consecutive_errors = 0
-                    last_poll = now
-                except Exception as e:
-                    self._diag_consecutive_errors += 1
-                    self._diag_last_error = str(e)[:200]
-                    log.error("Erreur lecture état (%s/3): %s", self._diag_consecutive_errors, e)
-                    last_poll = now
-                    self._mqtt.publish(self._topic("diag/consecutive_errors"),
-                                       str(self._diag_consecutive_errors))
-                    self._mqtt.publish(self._topic("diag/last_error"), self._diag_last_error)
-                    if self._diag_consecutive_errors >= 3:
-                        log.warning("3 erreurs consécutives — re-login...")
-                        await self._relogin()
-                        self._diag_consecutive_errors = 0
+                    self.device.send(build_query())     # READ-ONLY resync
+                except Exception as exc:
+                    LOG.debug("query failed: %s", exc)
 
-            await asyncio.sleep(1)
+            if self.mqtt and self.mqtt.is_connected():
+                if not self._discovery_done and self.state.mode is not None:
+                    self.publish_discovery()
+                self.publish_state()
 
-        # Arrêt propre
-        log.info("Arrêt du bridge...")
-        if self._fcm_client:
-            await self._fcm_client.stop()
-        self._mqtt.publish(self._topic("availability"), "offline")
-        self._mqtt.loop_stop()
-        self._mqtt.disconnect()
-        await self.cloud.close()
-
-
-# ── Point d'entrée ────────────────────────────────────────────────────────────
-
-async def _main():
-    bridge = MoovairMQTTBridge()
-
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: setattr(bridge, '_running', False))
-
-    while bridge._running:
+    def run(self):
+        self.start_mqtt()
+        threading.Thread(target=self.reader_loop, daemon=True).start()
         try:
-            await bridge.run()
-        except Exception as e:
-            log.critical("Erreur fatale inattendue: %s — redémarrage dans 15s", e, exc_info=True)
-            if bridge._running:
-                await asyncio.sleep(15)
-                bridge = MoovairMQTTBridge()  # reset complet
+            self.worker_loop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop.set()
+            if self.mqtt:
+                self.mqtt.publish(self.t("availability"), "offline", retain=True)
+                self.mqtt.loop_stop()
+            self.device.close()
+
+
+def main():
+    cfg = Config()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(message)s")
+    # ⚠ Set OUR logger only. Configuring the root logger at DEBUG makes
+    # `adb_shell` log every ADB packet — and `logread` delivers ~200 lines/s, so
+    # the process drowns in log formatting and commands crawl. That was the
+    # cause of the "super laggy control" seen 2026-08-14.
+    LOG.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+    for noisy in ("adb_shell", "adb_shell.adb_device", "adb_shell.transport",
+                  "paho", "paho.mqtt"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+    if not cfg.check_legacy():
+        sys.exit(1)
+    if cfg.cloud_mode == "local_only":
+        LOG.info("cloud_mode=local_only — the panel's weather icon will not "
+                 "work (it is AccuWeather data fetched via the cloud).")
+    LOG.info("moovair2mqtt v3 (local) starting — thermostat %s:%s",
+             cfg.thermostat_host, cfg.thermostat_port)
+    Bridge(cfg).run()
 
 
 if __name__ == "__main__":
-    log.info("moovair2mqtt — démarrage")
-    asyncio.run(_main())
+    main()

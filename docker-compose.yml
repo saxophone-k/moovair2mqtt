@@ -1,19 +1,51 @@
+# moovair2mqtt v3 — local bridge, no cloud and no Midea account.
+#
+# Run:   docker compose up -d
+# Logs:  docker compose logs -f
+# Stop:  docker compose down
+#
+# No `ports:` section: the bridge only makes OUTBOUND connections (ADB to the
+# thermostat, MQTT to the broker). Nothing ever connects *to* it.
+
 services:
   moovair2mqtt:
     image: ghcr.io/saxophone-k/moovair2mqtt:latest
+    container_name: moovair2mqtt
     restart: unless-stopped
+
     environment:
-      # ── Moovair account (required) ─────────────────────────────────────
-      M2M_MOOVAIR_USERNAME: "your.email@example.com"
-      M2M_MOOVAIR_PASSWORD: "your_password"
+      # ── Thermostat (required) ──────────────────────────────────────────
+      # No account, no password, no cloud — just the device's own IP.
+      # Give it a fixed IP so it never moves. Port 5555 is ADB.
+      # Whatever runs this container must be able to route to that address.
+      M2M_THERMOSTAT_HOST: "192.168.1.50:5555"
 
       # ── MQTT broker (required) ─────────────────────────────────────────
-      M2M_MQTT_HOST: "192.168.1.x"     # IP of your MQTT broker
+      M2M_MQTT_HOST: "192.168.1.10"
       M2M_MQTT_PORT: "1883"
-      # M2M_MQTT_USERNAME: ""           # if your broker requires auth
+      # M2M_MQTT_USERNAME: ""
       # M2M_MQTT_PASSWORD: ""
 
-      # ── Options (optional) ────────────────────────────────────────────
-      M2M_POLL_INTERVAL: "5"            # seconds between each poll (min recommended: 5)
+      # Migrating from v2? Also set M2M_DEVICE_ID to your Midea appliance ID,
+      # or Home Assistant creates a second device and your history is orphaned.
+      # See MIGRATION.md.
+      # M2M_DEVICE_ID: ""
+
+      # ── Options ────────────────────────────────────────────────────────
       M2M_MQTT_TOPIC_PREFIX: "moovair2mqtt"
-      M2M_LOG_LEVEL: "info"             # debug, info, warning, error
+      M2M_HA_DISCOVERY_PREFIX: "homeassistant"
+      M2M_LOG_LEVEL: "info"          # debug is very noisy — logread is ~200 lines/s
+
+      # Safety net only. The event stream is the primary read path; this is a
+      # periodic re-query in case an event is missed. ⚠ Keep it LOW-frequency:
+      # the thermostat's sensor task has been seen to wedge under heavy
+      # interaction, so the bridge deliberately does not hammer it.
+      # 0 disables it entirely.
+      M2M_QUERY_INTERVAL: "60"
+      M2M_HEARTBEAT_TIMEOUT: "30"
+
+      # "alongside" = coexists with the Moovair phone app (the whole reason the
+      # local bridge beats the cloud one). "local_only" for a device firewalled
+      # off the internet — that loses the panel's weather icon, which is
+      # AccuWeather data fetched via the cloud.
+      M2M_CLOUD_MODE: "alongside"

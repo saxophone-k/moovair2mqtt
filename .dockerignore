@@ -1,0 +1,25 @@
+# Keep the build context small.
+#
+# The working tree carries ~75 MB of reverse-engineering material in
+# local_recon/ (a 48 MB device sysroot, the 22 MB meiju binary). None of it is
+# needed to build the image, and local_recon/ is not published at all.
+
+.git
+.github
+.claude
+__pycache__
+*.pyc
+*.pyo
+*.log
+.env
+
+# Reverse-engineering material — never shipped.
+local_recon
+
+# Not needed at runtime.
+*.md
+tools
+docker-compose.yml
+
+# msgtool: the image needs the ARM binary, not its source.
+msgtool/msgtool.c

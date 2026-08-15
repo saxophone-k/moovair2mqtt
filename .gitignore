@@ -3,10 +3,20 @@ __pycache__/
 *.pyo
 .env
 *.log
-test_auth.py
+
+# Reverse-engineering working material — not part of the release.
+local_recon/
+
+# Internal working notes — never published.
+CLAUDE-moovair-local.md
+MOOVAIR_LOCAL_LOG.md
+MOOVAIR_LOCAL_PLAN.md
+ENTITIES_DISCOVERED.md
+
+# v2-era development scraps, superseded by the v3 bridge.
 control.py
 read_state.py
-moovair2mqttbeta.py
-test_json_api.py
-ENTITIES_DISCOVERED.md
 fcm_listen.py
+test_auth.py
+test_json_api.py
+moovair2mqttbeta.py
