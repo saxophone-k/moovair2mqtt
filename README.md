@@ -94,6 +94,8 @@ Only one hardware variant has been tested on real hardware. The bridge **detects
 | **Heat-pump only (no PTC)** | ⚠️ Untested — the PTC is an add-on, so some installs will not have one |
 | **°C** | ✅ Verified |
 | **°F** | ✅ Verified |
+| **Docker / TrueNAS SCALE** | ✅ Verified — this is how I run it |
+| **Home Assistant OS add-on** | ⚠️ **Untested — instructions provided, feedback wanted** |
 
 If you have one of the untested variants, please open an issue with the bridge's startup log — that is exactly the information needed.
 
@@ -123,6 +125,91 @@ docker compose logs -f
 ```
 
 You are looking for `ADB (command channel) connected`, `MQTT connected`, and `HA discovery published`.
+
+### Home Assistant OS (HA Green, HA Yellow, Raspberry Pi) — ⚠️ UNTESTED
+
+> **I have not tested this.** I run the bridge as a container on TrueNAS, not as a
+> Home Assistant add-on, and I have no HA OS machine to verify against. The steps
+> below are what *should* work. **If you try it, please open an issue and say what
+> you had to change** — I will fold it in and drop this warning.
+
+Home Assistant OS cannot run arbitrary containers; software has to be packaged as
+an **add-on**. There is no official add-on for this bridge yet, so you build a
+local one. It is about ten lines of configuration.
+
+**1. Get access to the `/addons` folder** — install either the *Samba share* or
+*Advanced SSH & Web Terminal* add-on from the official add-on store.
+
+**2. Create `/addons/moovair2mqtt/` and put three files in it.**
+
+`config.yaml`:
+
+```yaml
+name: moovair2mqtt
+version: "3.0.0"
+slug: moovair2mqtt
+description: Local control of a Moovair ST-1 thermostat, no cloud
+arch: [aarch64, amd64, armv7]
+init: false
+options:
+  thermostat_host: "192.168.1.50:5555"
+  mqtt_host: "192.168.1.10"
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  device_id: ""
+schema:
+  thermostat_host: str
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_username: str?
+  mqtt_password: password?
+  device_id: str?
+```
+
+`Dockerfile`:
+
+```dockerfile
+ARG BUILD_FROM=ghcr.io/saxophone-k/moovair2mqtt:3.0.0
+FROM ${BUILD_FROM}
+USER root
+RUN pip install --no-cache-dir bashio 2>/dev/null || true
+COPY run.sh /run.sh
+RUN chmod +x /run.sh
+CMD ["/run.sh"]
+```
+
+`run.sh` — **this is the part people miss.** Add-ons receive their settings as
+`/data/options.json`, *not* as environment variables, so they have to be
+translated:
+
+```sh
+#!/bin/sh
+CONF=/data/options.json
+export M2M_THERMOSTAT_HOST=$(sed -n 's/.*"thermostat_host": *"\([^"]*\)".*/\1/p' $CONF)
+export M2M_MQTT_HOST=$(sed -n 's/.*"mqtt_host": *"\([^"]*\)".*/\1/p' $CONF)
+export M2M_MQTT_PORT=$(sed -n 's/.*"mqtt_port": *\([0-9]*\).*/\1/p' $CONF)
+export M2M_MQTT_USERNAME=$(sed -n 's/.*"mqtt_username": *"\([^"]*\)".*/\1/p' $CONF)
+export M2M_MQTT_PASSWORD=$(sed -n 's/.*"mqtt_password": *"\([^"]*\)".*/\1/p' $CONF)
+export M2M_DEVICE_ID=$(sed -n 's/.*"device_id": *"\([^"]*\)".*/\1/p' $CONF)
+exec python -u /app/moovair2mqtt.py
+```
+
+**3. Install it.** Settings → Add-ons → Add-on Store → ⋮ → **Check for updates**,
+then look under **Local add-ons**. Open it, fill in the configuration tab, start.
+
+**4. Check the log** for `ADB (command channel) connected` and
+`HA discovery published`.
+
+**Before you start**, confirm the thermostat is reachable from your Home Assistant
+machine — from the SSH add-on terminal:
+
+```sh
+nc -vz YOUR_THERMOSTAT_IP 5555
+```
+
+If that does not connect, the bridge cannot work; check that the thermostat's
+VLAN is reachable from Home Assistant.
 
 ### TrueNAS SCALE
 
