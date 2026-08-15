@@ -184,7 +184,7 @@ class Config:
     4. docker compose up -d
 
   Prefer to stay on the cloud version?  Pin the image to  :2.1.0
-  Full guide: https://github.com/saxophone-k/moovair2mqtt/blob/v3.0.0/MIGRATION.md
+  Full guide: https://github.com/saxophone-k/moovair2mqtt/blob/main/MIGRATION.md
 {bar}
 """, file=sys.stderr)
             return False
