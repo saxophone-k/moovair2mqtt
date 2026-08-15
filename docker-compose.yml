@@ -1,22 +1,22 @@
-# moovair2mqtt v3 — LOCAL bridge.
+# moovair2mqtt v3 — local bridge, no cloud and no Midea account.
 #
-# Run:   docker compose -f docker-compose.local.yml up -d
-# Logs:  docker compose -f docker-compose.local.yml logs -f
-# Stop:  docker compose -f docker-compose.local.yml down
+# Run:   docker compose up -d
+# Logs:  docker compose logs -f
+# Stop:  docker compose down
 #
 # No `ports:` section: the bridge only makes OUTBOUND connections (ADB to the
 # thermostat, MQTT to the broker). Nothing ever connects *to* it.
 
 services:
-  moovair-local:
-    image: moovair2mqtt:v3-local
-    container_name: moovair-local
+  moovair2mqtt:
+    image: ghcr.io/saxophone-k/moovair2mqtt:latest
+    container_name: moovair2mqtt
     restart: unless-stopped
 
     environment:
       # ── Thermostat (required) ──────────────────────────────────────────
       # No account, no password, no cloud — just the device's own IP.
-      # Set a DHCP reservation for it so it never moves. Port 5555 is ADB.
+      # Give it a fixed IP so it never moves. Port 5555 is ADB.
       # Whatever runs this container must be able to route to that address.
       M2M_THERMOSTAT_HOST: "192.168.1.50:5555"
 
