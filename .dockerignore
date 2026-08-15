@@ -1,13 +1,8 @@
 # Keep the build context small.
 #
-# `bridge/` holds ~75 MB, of which ~73 MB is reverse-engineering material in
-# local_recon/ (a 48 MB device sysroot and the 22 MB meiju binary). The image
-# needs exactly ONE file out of that folder: the ARM msgtool.
-#
-# Note the form used below: exclude the *contents* of local_recon (local_recon/*)
-# rather than the folder itself, then re-include msgtool. Excluding the folder
-# outright would stop Docker descending into it and the negation would silently
-# fail.
+# The working tree carries ~75 MB of reverse-engineering material in
+# local_recon/ (a 48 MB device sysroot, the 22 MB meiju binary). None of it is
+# needed to build the image, and local_recon/ is not published at all.
 
 .git
 .github
@@ -18,22 +13,13 @@ __pycache__
 *.log
 .env
 
-# Reverse-engineering material — keep only msgtool.
-local_recon/*
-!local_recon/msgtool
-tools
+# Reverse-engineering material — never shipped.
+local_recon
 
-# Documentation and notes: not needed at runtime.
+# Not needed at runtime.
 *.md
-
-# v2 cloud bridge files — not part of the local image.
-moovair2mqtt.py
-moovair2mqttbeta.py
-requirements.txt
-Dockerfile
+tools
 docker-compose.yml
-control.py
-read_state.py
-fcm_listen.py
-test_auth.py
-test_json_api.py
+
+# msgtool: the image needs the ARM binary, not its source.
+msgtool/msgtool.c

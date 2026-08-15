@@ -1,4 +1,11 @@
-httpx>=0.27.0
-paho-mqtt>=1.6.1
-pycryptodome>=3.20.0
-firebase-messaging>=0.4.5
+# moovair2mqtt v3 — LOCAL bridge dependencies.
+#
+# Pinned to the exact versions verified working on the MacBook 2026-08-14.
+# Everything else (cryptography, rsa, pyasn1, cffi) is pulled in automatically
+# by adb-shell — no need to list transitive deps.
+#
+# v2's requirements.txt is NOT reused: httpx / pycryptodome / firebase-messaging
+# exist only for the cloud path, which v3 has none of.
+
+adb-shell==0.4.4
+paho-mqtt==2.1.0

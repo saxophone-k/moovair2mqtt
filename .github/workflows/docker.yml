@@ -42,14 +42,6 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          # ⚠ Without this, the build defaults to ./Dockerfile — the v2 CLOUD
-          # bridge. This branch ships the v3 LOCAL bridge, so it must be
-          # pointed explicitly at Dockerfile.local.
-          #
-          # This file is read from the branch being pushed, so `main` keeps its
-          # own copy and continues to build v2 as :latest. v2 users are
-          # unaffected until we deliberately merge.
-          file: ./Dockerfile.local
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

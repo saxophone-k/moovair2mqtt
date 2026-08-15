@@ -1,203 +1,196 @@
 # moovair2mqtt
 
-MQTT bridge for the **Moovair ST-1** central heat pump thermostat, enabling full control and monitoring from **Home Assistant**.
+Control a **Moovair ST-1** central heat-pump thermostat from **Home Assistant** — locally, over your own LAN, with no cloud and no internet dependency.
 
-Follows the same conventions as [mysa2mqtt](https://github.com/bourquep/mysa2mqtt).
+Moovair is a rebadged **Midea**. If your thermostat's app is Moovair, Midea, or one of the other Midea white-labels, this may work for you too.
 
-> **Disclaimer:** This project was built through reverse engineering of the Moovair Android APK. It is not affiliated with or endorsed by Moovair or Midea.
->
-> ⚠️ **Stability warning:** This bridge relies entirely on Moovair's **undocumented private cloud API**. If Moovair changes their API, authentication system, or encryption at any time, this bridge may stop working with no warning. Use it knowing this risk.
->
-> **A note from the author:** I am not a programmer — this entire project was built with the help of AI-assisted development. If you run into issues or have questions, I'll do my best to help, but please keep in mind that my ability to debug code is very limited. That said, feel free to open an issue — maybe someone in the community can step in! 😄
+```
+Home Assistant  ←→  MQTT  ←→  moovair2mqtt  ←→  thermostat (ADB, your LAN)
+```
+
+> **v3 is a breaking change.** v2 talked to Midea's cloud with your account. v3 talks to the thermostat directly and needs no account at all. If you are upgrading, read **[MIGRATION.md](MIGRATION.md)** first — there is one setting you must carry over or you will lose your entity history.
 
 ---
 
-## Features
+## ⚠ Read this before you install
 
-- ✅ **Ambient temperature** with **0.5°C precision** (via FCM push from thermostat)
-- ✅ **Indoor humidity** sensor (from thermostat's built-in sensor)
-- ✅ **Heat pump coil temperature** (T4 sensor on outdoor unit — useful for diagnostics)
-- ✅ Full control: setpoint, HVAC mode, fan speed
-- ✅ **Modes:** Auto (heat/cool), Heat, Cool, Fan Only, **Emergency Heat**
-- ⚠️ **Aux Heat** sensor — needs more reverse engineering. Is not currently working reliably
-- ✅ **Dry Mode** — dehumidification with 30-minute timer and real-time countdown (see notes below)
-- ✅ Automatic MQTT Discovery (Home Assistant auto-detects device, zero config)
-- ✅ Automatic session re-login when session expires
-- ✅ FCM push for real-time temperature & humidity updates (sub-second latency)
-- ⚠️ Aux-heat detection in normal heat mode (supplemental PTC): requires winter testing at -10°C or below (TODO)
+This project works because of a decision the vendor made, not one they documented:
+
+**The thermostat ships with `adbd` enabled, unauthenticated, as root, on TCP 5555.** Nothing is installed on the device and nothing is modified permanently. The bridge connects, reads the device's own logs, and injects commands into the internal message queue that the vendor's own cloud client uses.
+
+What follows from that, and should be accepted before relying on this:
+
+1. **A firmware update could close that door and break everything.** There is no workaround if it happens.
+2. **Firmware updates are cloud-triggered.** The device's updater only installs what the cloud stages for it. A real 49.9 MB firmware push landed on 2026-04-29.
+3. **Blocking the thermostat's internet access is therefore recommended**, to prevent over-the-air (OTA) updates and future enshittification — see [the trade-off](#the-local-only-trade-off) below.
+4. **Blocking it also kills the Moovair phone app**, which is cloud-only. Set up a VPN tunnel (Tailscale, WireGuard) and you can still control the thermostat through Home Assistant from outside your home — which is what the app was for anyway.
+5. **Anyone on that network segment has root on the thermostat.** That is true with or without this bridge, but you should know it. Put the thermostat on an IoT VLAN.
+
+**If you currently run the cloud-based bridge for this thermostat, turn it off first.** Cloud bridges register for push notifications, which replaces your phone's token and **logs you out of the Moovair app**. This bridge never touches your Midea account, so it does not do that.
+
+---
+
+## What you get
+
+10 entities, published via MQTT discovery — they appear in Home Assistant on their own.
+
+| Entity | Type | Notes |
+|---|---|---|
+| **Moovair** | Climate | Off / Auto / Cool / Heat / Fan only, fan Auto·Low·Med·High, whole degrees |
+| **Emergency Heat** | Climate preset | Heat pump bypassed, resistive element only |
+| **Freeze Protection** | Switch | The panel's 8 °C freeze-protect mode (heat mode only) |
+| **Dry Mode** | Switch | Start / stop dehumidify |
+| **Dry Duration** | Number | 5–120 min, freely settable |
+| **Dry Mode Remaining** | Sensor | Counts down once per minute |
+| **Indoor Humidity** | Sensor | % |
+| **Indoor Coil Temperature** | Sensor | °C |
+| **Outdoor Coil Temperature** | Sensor | °C — condenser when cooling, evaporator when heating |
+| **Aux Heat** | Binary sensor | The resistive element actually drawing power |
+| **Heat Pump** | Binary sensor | Compressor running |
+
+**It is fast.** State changes made at the panel appear in Home Assistant essentially instantly. Commands are injected in ~100–160 ms and confirmed by the device in ~200 ms.
+
+**Things the cloud API could not do, and this can:**
+
+- **Set any dry-mode duration.** The app offers four fixed buttons; the device accepts anything.
+- **Read indoor coil temperatures**, which the cloud never exposed.
+- **Run alongside the Moovair app**, because it never logs into your account.
 
 ---
 
 ## Requirements
 
-- **Docker** (to run the bridge as a container)
-- **An MQTT broker** — e.g. [Mosquitto](https://mosquitto.org/)
-- **Home Assistant** with the [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) enabled
-- **A Moovair account** (email + password from the Moovair app)
+- The thermostat, reachable on your network. **Give it a fixed IP address, or the bridge will stop working when the address changes** — in your router this is usually called a *DHCP reservation* or *static lease*.
+- An **MQTT broker** (e.g. Mosquitto) and Home Assistant's MQTT integration.
+- Docker, or any way to run a Python 3.11+ script.
 
-> ⚠️ **Known limitation — session conflict:** The Moovair cloud only supports **one active session per account**. The bridge and the Moovair mobile app cannot run at the same time — the bridge takes over the session and the app gets disconnected. Close the app when the bridge is running.
+You do **not** need `adb` installed. The bridge speaks the ADB protocol itself in pure Python.
 
 ---
 
-## Quick Start (Docker)
+## Is my unit supported?
 
-### docker-compose.yml
+Only one hardware variant has been tested on real hardware. The bridge **detects what your unit reports and builds entities to match** — it omits an entity rather than publishing a guess, and logs anything it does not recognise so it can be reported.
+
+| | Status |
+|---|---|
+| **2-wire communicating bus** | ✅ **Verified on real hardware** |
+| **24 V conventional multi-wire** | ⚠️ **Decoded but UNTESTED — testers wanted** |
+| **With PTC resistive element** | ✅ Verified |
+| **Heat-pump only (no PTC)** | ⚠️ Untested — the PTC is an add-on, so some installs will not have one |
+| **°C** | ✅ Verified |
+| **°F** | ✅ Verified |
+
+If you have one of the untested variants, please open an issue with the bridge's startup log — that is exactly the information needed.
+
+---
+
+## Install
+
+### Docker Compose
 
 ```yaml
 services:
   moovair2mqtt:
     image: ghcr.io/saxophone-k/moovair2mqtt:latest
+    container_name: moovair2mqtt
     restart: unless-stopped
     environment:
-      M2M_MOOVAIR_USERNAME: "your.email@example.com"
-      M2M_MOOVAIR_PASSWORD: "your_password"
-      M2M_MQTT_HOST: "192.168.1.x"        # Your MQTT broker IP
+      M2M_THERMOSTAT_HOST: "192.168.1.50:5555"   # your thermostat
+      M2M_MQTT_HOST: "192.168.1.10"              # your broker
       M2M_MQTT_PORT: "1883"
-      # M2M_MQTT_USERNAME: ""             # if your broker requires auth
+      # M2M_MQTT_USERNAME: ""
       # M2M_MQTT_PASSWORD: ""
-      M2M_POLL_INTERVAL: "30"             # seconds between polls (recommended: 30)
-      M2M_LOG_LEVEL: "info"               # debug, info, warning, error
 ```
 
-### Start
-
-```bash
+```sh
 docker compose up -d
+docker compose logs -f
 ```
 
-### Home Assistant
+You are looking for `ADB (command channel) connected`, `MQTT connected`, and `HA discovery published`.
 
-Home Assistant auto-discovers the thermostat via MQTT Discovery. Check:  
-**Settings → Devices & Services → MQTT**
+### TrueNAS SCALE
 
----
-
-## TrueNAS Scale
-
-1. **Apps → Custom App**
-2. Image: `ghcr.io/saxophone-k/moovair2mqtt:latest`
-3. Add environment variables (see table below)
-4. Deploy
+**Apps → Discover Apps → Custom App.** Image repository `ghcr.io/saxophone-k/moovair2mqtt`, tag `latest`, restart policy *Unless Stopped*. Add the environment variables above. **No ports and no storage are needed** — the bridge only makes outbound connections and stores nothing.
 
 ---
 
-## Environment Variables
+## Configuration
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `M2M_MOOVAIR_USERNAME` | ✅ | — | Moovair account email |
-| `M2M_MOOVAIR_PASSWORD` | ✅ | — | Moovair account password |
-| `M2M_MQTT_HOST` | ✅ | — | MQTT broker IP or hostname |
-| `M2M_MQTT_PORT` | — | `1883` | MQTT broker port |
-| `M2M_MQTT_USERNAME` | — | — | MQTT username (if auth enabled) |
-| `M2M_MQTT_PASSWORD` | — | — | MQTT password (if auth enabled) |
-| `M2M_MQTT_TOPIC_PREFIX` | — | `moovair2mqtt` | MQTT topic prefix |
-| `M2M_POLL_INTERVAL` | — | `30` | Poll interval in seconds |
-| `M2M_LOG_LEVEL` | — | `info` | Log level: `debug` / `info` / `warning` / `error` |
+| Variable | Required | Default | What it does |
+|---|---|---|---|
+| `M2M_THERMOSTAT_HOST` | ✅ | — | `ip:5555` of the thermostat |
+| `M2M_MQTT_HOST` | ✅ | — | MQTT broker address |
+| `M2M_MQTT_PORT` | | `1883` | |
+| `M2M_MQTT_USERNAME` | | — | If your broker requires auth |
+| `M2M_MQTT_PASSWORD` | | — | |
+| `M2M_MQTT_TOPIC_PREFIX` | | `moovair2mqtt` | State/command topic root |
+| `M2M_HA_DISCOVERY_PREFIX` | | `homeassistant` | Match your HA setting |
+| `M2M_DEVICE_ID` | | derived from the IP | **Seeds every entity's `unique_id`.** See below |
+| `M2M_CLOUD_MODE` | | `alongside` | `alongside` or `local_only` |
+| `M2M_QUERY_INTERVAL` | | `60` | Safety-net re-query, seconds. `0` disables |
+| `M2M_HEARTBEAT_TIMEOUT` | | `30` | Seconds of silence before marking the device offline |
+| `M2M_LOG_LEVEL` | | `info` | `debug` is very noisy |
 
----
+### `M2M_DEVICE_ID` — the one to think about
 
-## Home Assistant Entities
+It seeds every entity's `unique_id`, so **it must stay stable for the life of the install**. Change it and Home Assistant creates a fresh set of entities and orphans your history, dashboards and automations.
 
-| Entity | Type | Description |
-|--------|------|-------------|
-| Moovair | `climate` | Full thermostat control (mode, setpoint, fan) |
-| Aux Heat | `binary_sensor` | Electric backup element active |
-| Indoor Humidity | `sensor` | Relative humidity % from thermostat sensor |
-| Heat Pump Coil Temperature | `sensor` | T4 outdoor unit coil temp (°C) — NOT outdoor ambient |
-| Dry Mode | `switch` | Dehumidification ON/OFF toggle (see notes) |
-| Dry Mode Remaining | `sensor` | Minutes remaining in current dry mode session |
+By default it is derived from the thermostat's IP address, which is fine since we recommended giving it a fixed IP. Set it explicitly if you ever change the thermostat's IP — or if you are **migrating from v2**, in which case it must be your Midea appliance ID. See [MIGRATION.md](MIGRATION.md).
 
 ---
 
-## Dry Mode
+## The local-only trade-off
 
-Dry mode activates the dehumidification function of the ST-1, which reduces humidity without aggressively cooling the room.
+The bridge works whether or not the thermostat can reach the internet. Blocking it is a real decision with a real cost:
 
-### How it works in the Moovair app
+| | WAN open (`alongside`) | WAN blocked (`local_only`) |
+|---|---|---|
+| Home Assistant | ✅ | ✅ |
+| Moovair phone app | ✅ works alongside | ❌ dead — it is cloud-only |
+| Weather icon on the panel | ✅ | ❌ lost — it is AccuWeather, fetched via the cloud |
+| Vendor firmware updates | ⚠️ exposed | ✅ protected |
+| Privacy | ⚠️ telemetry to the vendor | ✅ nothing leaves your LAN |
+| Vendor enshittification | ⚠️ exposed | ✅ protected |
 
-The Moovair app offers a dry mode with 4 duration options (15 / 30 / 45 / 60 minutes). The thermostat dehumidifies for the selected duration, then automatically returns to the previous mode.
+Set `M2M_CLOUD_MODE: "local_only"` when you have firewalled the device, and the bridge stops advertising what it cannot deliver.
 
-### Current implementation in this bridge
-
-**Only 30-minute sessions are supported.** The bridge exposes a simple `ON/OFF` select entity in Home Assistant.
-
-When the switch is turned **ON**:
-1. The bridge sends the dry mode command to the device
-2. The thermostat activates dry mode for 30 minutes
-3. **Dry Mode Remaining** counts down in real time using the thermostat's own timer (live FCM push data — not a bridge-side estimate)
-4. When the timer reaches 0, the switch automatically turns **OFF**
-
-You can also turn the switch **OFF** at any time to cancel dry mode immediately.
-
-**Why only 30 minutes?** The Moovair cloud API provides two separate commands for dry mode: one to set the duration (`dry_time_interval`), and one to activate the mode. Through reverse engineering, we were able to implement the activation reliably. However, setting a custom duration via the cloud API does not appear to take effect when sent through the transparent-send protocol path used by this bridge — the device always uses its last locally-set duration.
-
-**Contributions welcome:** If you can figure out how to reliably set the dry mode duration (15 / 45 / 60 min) via the cloud API, please open a PR! The relevant code is in `MoovairCloud.send_dry_mode()`.
+**Recommended:** block the thermostat's WAN access at your router, keep LAN access. You lose a decorative weather icon and the phone app; you gain immunity from vendor updates breaking your thermostat.
 
 ---
 
-## MQTT Topics
+## How it works
 
-Topics follow the format `{prefix}/{device_id}/{field}` (default prefix: `moovair2mqtt`).
+Two channels, both over one ADB connection to the device:
 
-### State (bridge → HA)
+- **Read** — tail the thermostat's own `logread`. The vendor's control daemon logs its full parsed state in plaintext, several times a second. No polling, no crypto.
+- **Write** — inject command frames into the System V message queue that the vendor's own cloud client writes to. The device's own daemon builds the serial frame for the control board. We never craft control-board bytes by hand.
 
-| Topic | Values | Notes |
-|-------|--------|-------|
-| `.../current_temperature` | e.g. `22.5` | 0.5°C precision from FCM |
-| `.../target_temperature` | e.g. `23.0` | |
-| `.../mode` | `off`, `heat`, `cool`, `heat_cool`, `fan_only`, `emergency_heat` | |
-| `.../fan_mode` | `auto`, `low`, `medium`, `high` | |
-| `.../action` | `heating`, `cooling`, `idle`, `off`, `fan` | |
-| `.../aux_heat` | `ON`, `OFF` | |
-| `.../indoor_humidity` | e.g. `53` | % |
-| `.../outdoor_temperature` | e.g. `29.5` | T4 coil sensor, not ambient |
-| `.../dry_mode` | `ON`, `OFF` | |
-| `.../dry_mode_remaining` | `0`–`30` | Minutes, real thermostat data |
-| `.../availability` | `online`, `offline` | LWT |
+Because both sides are the vendor's own paths, the panel display, the phone app and Home Assistant all stay in sync.
 
-### Commands (HA → bridge)
-
-| Topic | Values |
-|-------|--------|
-| `.../set/mode` | `off`, `heat`, `cool`, `heat_cool`, `fan_only`, `emergency_heat` |
-| `.../set/target_temperature` | e.g. `22.0` |
-| `.../set/fan_mode` | `auto`, `low`, `medium`, `high` |
-| `.../set/dry_mode` | `ON`, `OFF` |
+`msgtool` is a small statically linked ARM helper that performs the queue write. It is **pushed to the thermostat automatically** on startup and after any device reboot (the device's `/tmp` is volatile). Source and build instructions: [`msgtool/`](msgtool/).
 
 ---
 
-## How It Works
+## Troubleshooting
 
-This bridge communicates with the Moovair cloud (Midea NetHomePlus infrastructure) using a reverse-engineered protocol:
+**Everything reads "Unknown" after upgrading from v2** — stale retained discovery from the old bridge is shadowing the new one. Run [`tools/clear_legacy_discovery.py`](tools/clear_legacy_discovery.py); see [MIGRATION.md](MIGRATION.md).
 
-1. **Authentication:** SHA256 signature + AES/ECB session key derived from login
-2. **State polling:** `app2base/data/transmit` → Lua `json2data` → `appliance/transparent/send` → decoded binary payload
-3. **Control:** Same path with a control JSON payload
-4. **Live temperature & humidity:** Firebase Cloud Messaging (FCM) — the thermostat pushes state updates every ~11 seconds; `byte[37]` = indoor temp, `byte[36]` = humidity %, `byte[57]` = dry mode remaining minutes
-5. **Precise temperature (0.5°C):** FCM sub-type A1 message, `byte[30]` using formula `(raw - 50) / 2`
+**`ADB connection refused`** — confirm the thermostat's IP, and that whatever runs the bridge can route to it. If your thermostat is on an IoT VLAN, that VLAN must be reachable from the container's host.
 
-### Emergency Heat vs. Heat
+**Two thermostats in Home Assistant** — you changed `M2M_DEVICE_ID` or the topic prefix, so a second set of entities was created. Clear the old ones with the tool above.
 
-- **Heat mode:** Uses the heat pump. The resistive electric element (if your furnace is equipped with one) supplements automatically. Automatic detection of supplemental PTC and conditions for supplemental PTC activation in this mode have not yet been resverse engineered.
-- **Emergency Heat:** Bypasses the heat pump entirely. Only the electric element runs (if equipped). Use only if the heat pump is broken. A warning is displayed on the thermostat.
+**The panel display does not follow Home Assistant** — please open an issue. Some commands notify the panel and some do not; the bridge deliberately routes everything the panel cares about through the channel that repaints it.
 
 ---
 
 ## Contributing
 
-Pull requests are welcome!
-
-Areas where community help is especially needed:
-
-- **Dry mode duration control** — setting 15 / 45 / 60 min via the cloud API (see `send_dry_mode()`)
-- **Supplemental PTC detection in normal heat mode** — requires testing to identify which payload byte changes when the electric element activates
-- **Additional entities** — swing, eco mode, turbo, sleep mode (APK analysis suggests these exist in the protocol but haven't been implemented)
-
-To report a bug or suggest an improvement: [open an issue](../../issues).
-
----
+Most valuable right now: **reports from untested hardware** — 24V wiring configuration and heat-pump-only units without the PTC element. The startup log lists everything the bridge detected, and that is enough to tell whether it guessed right.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE).
+
+**No affiliation with Midea, Moovair, or any reseller.** This is unofficial, built by reverse engineering, and could stop working at any time.
