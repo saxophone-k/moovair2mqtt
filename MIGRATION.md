@@ -28,7 +28,7 @@ mosquitto_sub -h YOUR_BROKER_IP -W 3 -v -t 'homeassistant/#' \
 Expected output — a single line:
 
 ```
-moovair_151732606682728
+moovair_123456789012345
 ```
 
 Your appliance ID is the number after `moovair_`.
@@ -78,7 +78,7 @@ services:
 
       # ── new in v3 ────────────────────────────────────
       M2M_THERMOSTAT_HOST: "192.168.1.50:5555"       # step 3
-      M2M_DEVICE_ID: "151732606682728"               # step 1 — YOUR id
+      M2M_DEVICE_ID: "123456789012345"               # step 1 — YOUR id
 
       # ── unchanged ────────────────────────────────────
       M2M_MQTT_HOST: "192.168.1.10"

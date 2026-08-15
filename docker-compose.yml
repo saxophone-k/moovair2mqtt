@@ -26,18 +26,20 @@ services:
       # M2M_MQTT_USERNAME: ""
       # M2M_MQTT_PASSWORD: ""
 
-      # ⚠ TEST PREFIX — publishes to separate topics so the live v2 entities in
-      # Home Assistant stay untouched. Changing this to "moovair2mqtt" IS the
-      # cutover; do it deliberately, after TrueNAS deployment, not by accident.
-      M2M_MQTT_TOPIC_PREFIX: "moovair_local_test"
-      M2M_HA_DISCOVERY_PREFIX: "homeassistant"
+      # Migrating from v2? Also set M2M_DEVICE_ID to your Midea appliance ID,
+      # or Home Assistant creates a second device and your history is orphaned.
+      # See MIGRATION.md.
+      # M2M_DEVICE_ID: ""
 
       # ── Options ────────────────────────────────────────────────────────
+      M2M_MQTT_TOPIC_PREFIX: "moovair2mqtt"
+      M2M_HA_DISCOVERY_PREFIX: "homeassistant"
       M2M_LOG_LEVEL: "info"          # debug is very noisy — logread is ~200 lines/s
 
       # Safety net only. The event stream is the primary read path; this is a
       # periodic re-query in case an event is missed. ⚠ Keep it LOW-frequency:
-      # aggressive polling is a suspect in the sensor wedges seen 2026-08-13/14.
+      # the thermostat's sensor task has been seen to wedge under heavy
+      # interaction, so the bridge deliberately does not hammer it.
       # 0 disables it entirely.
       M2M_QUERY_INTERVAL: "60"
       M2M_HEARTBEAT_TIMEOUT: "30"

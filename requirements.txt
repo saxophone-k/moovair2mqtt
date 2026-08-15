@@ -1,6 +1,6 @@
 # moovair2mqtt v3 — LOCAL bridge dependencies.
 #
-# Pinned to the exact versions verified working on the MacBook 2026-08-14.
+# Pinned to the exact versions verified against real hardware.
 # Everything else (cryptography, rsa, pyasn1, cffi) is pulled in automatically
 # by adb-shell — no need to list transitive deps.
 #

@@ -25,7 +25,7 @@ USAGE
 -----
   python3 clear_legacy_discovery.py --host 192.168.1.x                  # list
   python3 clear_legacy_discovery.py --host 192.168.1.x --apply          # clear
-  ... --device-id 151732606682728 --old-prefix moovair2mqtt
+  ... --device-id YOUR_APPLIANCE_ID --old-prefix moovair2mqtt
 """
 
 import argparse
@@ -49,7 +49,9 @@ def main():
     ap.add_argument("--port", type=int, default=1883)
     ap.add_argument("--username")
     ap.add_argument("--password")
-    ap.add_argument("--device-id", default="151732606682728")
+    ap.add_argument("--device-id", required=True,
+                    help="the id in the discovery topic: homeassistant/climate/"
+                         "moovair_<THIS>/config")
     ap.add_argument("--old-prefix", default="moovair2mqtt",
                     help="v2 state topic prefix (default: moovair2mqtt)")
     ap.add_argument("--discovery-prefix", default="homeassistant")
