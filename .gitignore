@@ -10,3 +10,18 @@ moovair2mqttbeta.py
 test_json_api.py
 ENTITIES_DISCOVERED.md
 fcm_listen.py
+
+# Reverse-engineering material stays private — EXCEPT msgtool, which the image
+# genuinely needs (Dockerfile.local copies it, and the GitHub Actions builder
+# can only see committed files).
+#
+# ⚠ Note the form: ignore the CONTENTS (local_recon/*), not the folder itself.
+# Writing `local_recon/` stops git descending into it and the `!` exception
+# below would silently never match.
+local_recon/*
+!local_recon/msgtool
+
+# Working session notes — internal, not for the public repo.
+MOOVAIR_LOCAL_LOG.md
+MOOVAIR_LOCAL_PLAN.md
+CLAUDE-moovair-local.md
