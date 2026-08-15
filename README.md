@@ -42,6 +42,8 @@ What follows from that, and should be accepted before relying on this:
 4. **Blocking it also kills the Moovair phone app**, which is cloud-only. Set up a VPN tunnel (Tailscale, WireGuard) and you can still control the thermostat through Home Assistant from outside your home — which is what the app was for anyway.
 5. **Anyone on that network segment has root on the thermostat.** That is true with or without this bridge, but you should know it. Put the thermostat on an IoT VLAN.
 
+> **🛟 Back up your firmware now, while ADB is open.** The single best protection against point 1 is to image your device's firmware *before* any update can close the port — then you have a known-good copy to return to. It takes about ten minutes and it's read-only/safe. See **[FIRMWARE_BACKUP.md](FIRMWARE_BACKUP.md)**. *(Already locked out by an update? A known-good image of this exact hardware exists — see the end of that doc.)*
+
 **If you currently run the cloud-based bridge for this thermostat, turn it off first.** Cloud bridges register for push notifications, which replaces your phone's token and **logs you out of the Moovair app**. This bridge never touches your Midea account, so it does not do that.
 
 ---
