@@ -12,7 +12,7 @@ Home Assistant  ←→  MQTT  ←→  moovair2mqtt  ←→  thermostat (ADB, you
 >
 > **This is a breaking change.** Everything up to v2.1.0 controlled the thermostat through Midea's cloud, using your Moovair account. **v3 talks to the thermostat directly over your own network** — no account, no cloud, no internet required. It is roughly 50× faster, it no longer logs you out of the Moovair app, and it can do things the cloud API simply could not.
 >
-> **Already running v2? Read [MIGRATION.md](MIGRATION.md) before you upgrade.** It takes about ten minutes, and there is **one setting** you must carry over or Home Assistant will create a second thermostat and orphan all your history.
+> **Were you already running v2 and all of a sudden your integration stopped working? This is normal.** v3.0.0 is a complete redesign from v2.1.0. Read **[MIGRATION.md](MIGRATION.md)** to get everything back up and running. It takes about ten minutes, and there is **one setting** you must carry over or Home Assistant will create a second thermostat and orphan all your history.
 >
 > **Not ready?** Nothing is forced on you — pin `ghcr.io/saxophone-k/moovair2mqtt:2.1.0` and the cloud bridge keeps working exactly as before.
 
