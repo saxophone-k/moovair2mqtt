@@ -98,10 +98,22 @@ TEMP_OFFSET = 62               # UART sensor bytes: °C = raw - 62
 # available_mode bitmask → which hvac modes the unit supports.
 # The reference unit reports 0x7f. Bit meanings are INFERRED; when a bit is unknown
 # we keep the mode rather than hide a working one.
+#
+# ⚠ 0x08 IS **EMERGENCY HEAT**, NOT `MODE_HEAT`. Measured twice on hardware
+# 2026-08-16: turning the panel's Settings → Auxiliary Heat switch OFF changes
+# available_mode 0x7f → 0x77 (bit 3 clears) while plain **Heat remains on the
+# panel** and Emergency disappears. It was previously mapped to MODE_HEAT, which
+# would have stripped HEAT out of the HA climate entity whenever the owner
+# switched aux heat off — i.e. exactly when they still need the heat pump.
+#
+# Which bit really means MODE_HEAT is still UNKNOWN, so MODE_HEAT is deliberately
+# absent here: an unmapped mode is never hidden (see publish_discovery).
 AVAILABLE_MODE_BITS = {
     MODE_AUTO: 0x01, MODE_COOL: 0x02, MODE_DRY: 0x04,
-    MODE_HEAT: 0x08, MODE_FAN: 0x10,
+    MODE_FAN: 0x10,
 }
+# Emergency heat is a PRESET in HA, not a mode, so it is gated separately.
+AVAILABLE_MODE_EMERGENCY = 0x08
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +144,15 @@ class Config:
         self.mqtt_user = _env("M2M_MQTT_USERNAME")
         self.mqtt_pass = _env("M2M_MQTT_PASSWORD")
         self.prefix = _env("M2M_MQTT_TOPIC_PREFIX", "moovair2mqtt")
+        # ⚠ The MQTT client id used to be hardcoded, so running a second copy
+        # for testing — even on a throwaway topic prefix — fought the production
+        # instance for the same broker identity and the two kicked each other
+        # off in a loop. Derive it from the prefix so a test instance is
+        # automatically distinct; the default prefix keeps the original id so
+        # existing deployments are unchanged.
+        default_id = ("moovair-local" if self.prefix == "moovair2mqtt"
+                      else f"moovair-local-{self.prefix}")
+        self.mqtt_client_id = _env("M2M_MQTT_CLIENT_ID", default_id)
         self.discovery_prefix = _env("M2M_HA_DISCOVERY_PREFIX", "homeassistant")
         self.log_level = _env("M2M_LOG_LEVEL", "info")
         self.cloud_mode = _env("M2M_CLOUD_MODE", "alongside")  # alongside|local_only
@@ -362,13 +383,41 @@ RE_SENSOR_RAW = re.compile(r"f_temp = ([\d.]+)\s+sensor->humi_val = ([\d.]+)")
 # NOTE: the countdown appears on TWO lines with DIFFERENT separators — the
 # per-minute tick is on the meiju "notify" line which uses '='. Parse both.
 RE_DEHUM = re.compile(r"dehum_time_left[:=](\d+), dehum_interval[:=](\d+)")
+# ⚠ meiju prints the capability block on TWO different lines:
+#   thermostat_ui_dev_state_response      — periodic, HAS comm_mode/aux_type
+#   thermostat_ui_notify_dev_state_update — ON CHANGE, has NO comm_mode
+# The old pattern required comm_mode, so it never matched the notify line — the
+# very line that fires the instant the owner flips the aux switch. Worse, both
+# lines also carry `dehum_time_left:.., dehum_interval:..`, so RE_DEHUM matched
+# first and returned, meaning RE_UI never ran on EITHER line and
+# available_mode / aux_heat_open / heating_max / cooling_min were permanently
+# None in production. Found 2026-08-16 by replaying real captures.
 RE_UI = re.compile(
     r"heating_max=(\d+),\s+cooling_min=(\d+).*?aux_heat_open=(\d+).*?"
-    r"comm_mode=(\d+).*?available_mode:([0-9a-fA-F]+)")
+    r"available_mode:([0-9a-fA-F]+)")
+RE_COMM_MODE = re.compile(r"comm_mode=(\d+)")
 # `msmart_cmd_ctrl` logs this on every change — from HA, the app, or the panel —
 # which is our only read-back for freeze protection (it is not in AHU3_STATE).
 RE_FREEZE = re.compile(r"msmart set degree8Heat=(\d)")
 RE_UART_C0 = re.compile(r"^\[aa c0 ((?:[0-9a-f]{2} )+)")
+
+# ── the ONLY true "element is drawing" signal ────────────────────────────────
+# `dev_app` reports appliance status UP to msmart as a 99-byte `aa 62 44` frame,
+# logged as `send msmart frame  size=99` followed by the hex over several lines.
+# Byte[40] & 0x04 == the PTC resistive element is ENERGISED (0x34 on / 0x30 off).
+#
+# ⚠ This is NOT `elec_heat`. Measured 2026-08-16 against Nicholas watching the
+# panel: `elec_heat` means "supplemental electric heat is PERMITTED in this mode"
+# (the DIM corner icon) and read 1 through an entire normal-heat run in August
+# with nothing firing, and 0 while 10 kW was genuinely burning in emergency heat.
+# Byte[40] flipped to 0x34 exactly when the icon went BRIGHT and back at 0x30
+# when he returned to cool. The bit was documented in the cloud-era byte map and
+# never wired up when the bridge went local.
+RE_FRAME_START = re.compile(r"^\[([0-9a-f]{2}(?: [0-9a-f]{2})*)\s*(\])?\s*$")
+RE_FRAME_CONT = re.compile(r"^([0-9a-f]{2}(?: [0-9a-f]{2})*)\s*(\])?\s*$")
+MSMART_STATUS_TYPE = 0x62      # frame[1]
+MSMART_STATUS_LEN = 99
+PTC_BYTE, PTC_BIT = 40, 0x04
 
 
 def f2c(f):
@@ -384,7 +433,8 @@ class State:
         self.setpoint = None
         self.fan = None
         self.fan_state = None
-        self.elec_heat = None
+        self.elec_heat = None          # PERMITTED in this mode = dim corner icon
+        self.elec_heat_draw = None     # ENERGISED (aa 62 44 [40]&0x04) = bright icon
         self.elec_heat_only = None
         self.compressor = None
         self.indoor_temp = None
@@ -405,6 +455,9 @@ class State:
         self.available_mode = None
         self.last_seen = 0.0
         self.dirty = set()
+        # Multi-line hex frame accumulator (see _feed_frame). Not a published
+        # field, so it is assigned directly and never goes through set().
+        self._fbuf = None
 
     def set(self, field, value):
         # NOTE: None is a meaningful value for fields that can go "unavailable"
@@ -443,6 +496,21 @@ class State:
     @property
     def preset(self):
         return PRESET_EMERGENCY if self.elec_heat_only else PRESET_NORMAL
+
+
+def _finish_frame(st: State):
+    """A complete `aa ..` hex frame was collected from the log."""
+    b, st._fbuf = st._fbuf, None
+    if not b or len(b) < 2 or b[0] != 0xAA:
+        return
+    if b[1] != MSMART_STATUS_TYPE:
+        return
+    if len(b) != MSMART_STATUS_LEN:
+        # Only the 99-byte layout is verified; byte offsets are layout-specific.
+        LOG.debug("aa 62 status frame of unexpected length %d — ignored "
+                  "(please report)", len(b))
+        return
+    st.set("elec_heat_draw", 1 if b[PTC_BYTE] & PTC_BIT else 0)
 
 
 def parse_line(line: str, st: State):
@@ -487,23 +555,53 @@ def parse_line(line: str, st: State):
     if m:
         st.last_seen = time.time()           # ~1/s → liveness heartbeat only
         return
-    m = RE_DEHUM.search(line)
-    if m:
-        st.set("dry_remaining", int(m.group(1)))
-        st.set("dry_interval", int(m.group(2)))
-        return
+    # ⚠ RE_UI MUST be tested BEFORE RE_DEHUM: meiju's capability block carries
+    # the dry countdown too, so RE_DEHUM would match it and return, and the
+    # capabilities would never be read (that is exactly what shipped).
     m = RE_UI.search(line)
     if m:
         st.set("heating_max", int(m.group(1)))
         st.set("cooling_min", int(m.group(2)))
         st.set("aux_heat_open", int(m.group(3)))
-        st.set("comm_mode", int(m.group(4)))
-        st.set("available_mode", int(m.group(5), 16))
+        st.set("available_mode", int(m.group(4), 16))
+        c = RE_COMM_MODE.search(line)       # response line only
+        if c:
+            st.set("comm_mode", int(c.group(1)))
+        d = RE_DEHUM.search(line)           # the same line carries these
+        if d:
+            st.set("dry_remaining", int(d.group(1)))
+            st.set("dry_interval", int(d.group(2)))
+        return
+    m = RE_DEHUM.search(line)
+    if m:
+        st.set("dry_remaining", int(m.group(1)))
+        st.set("dry_interval", int(m.group(2)))
         return
     m = RE_FREEZE.search(line)
     if m:
         st.set("freeze", m.group(1) == "1")
         return
+    # ── multi-line hex frame accumulation ────────────────────────────────
+    # Runs BEFORE the c0 branch's early return so that a new frame always
+    # resets a half-collected buffer — otherwise a c0 frame's continuation
+    # lines would be appended to a pending `aa 62` frame and corrupt it.
+    fm = RE_FRAME_START.match(line)
+    if fm:
+        st._fbuf = [int(x, 16) for x in fm.group(1).split()]
+        if fm.group(2):
+            _finish_frame(st)
+        # fall through — the c0 branch below still wants this line
+    elif st._fbuf is not None:
+        if not line.strip():
+            return                           # logread interleaves blank lines
+        fc = RE_FRAME_CONT.match(line)
+        if fc:
+            st._fbuf.extend(int(x, 16) for x in fc.group(1).split())
+            if fc.group(2):
+                _finish_frame(st)
+            return
+        st._fbuf = None                      # any other line ends the frame
+
     m = RE_UART_C0.search(line)
     if m:
         # group(1) begins AFTER "[aa c0 ", so b[i] == frame byte (i + 2).
@@ -532,6 +630,7 @@ class Bridge:
         self.cmd_q: queue.Queue = queue.Queue()
         self.mqtt = None
         self._discovery_done = False
+        self._disc_sig = None           # last-published discovery inputs
         self._stop = threading.Event()
         self._device_online = None      # None = unknown yet
         self._pending = {}              # field -> (value, sent_at) for latency
@@ -548,9 +647,9 @@ class Bridge:
     def start_mqtt(self):
         try:
             client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                                 client_id="moovair-local")
+                                 client_id=self.cfg.mqtt_client_id)
         except (AttributeError, TypeError):       # paho 1.x
-            client = mqtt.Client(client_id="moovair-local")
+            client = mqtt.Client(client_id=self.cfg.mqtt_client_id)
         if self.cfg.mqtt_user:
             client.username_pw_set(self.cfg.mqtt_user, self.cfg.mqtt_pass or "")
         client.will_set(self.t("availability"), "offline", retain=True)
@@ -592,6 +691,29 @@ class Bridge:
         self.mqtt.publish(self.t(leaf), str(value), retain=retain)
 
     # ── HA discovery (self-configuring) ──────────────────────────────────
+    def _emergency_available(self):
+        """Is the panel's Auxiliary Heat switch ON?
+
+        `available_mode` bit 3 is the authority (measured 2026-08-16: 0x7f with
+        the switch on, 0x77 with it off). Before we have ever seen the meiju
+        state block, assume available rather than hide a working feature.
+        """
+        st = self.state
+        if st.available_mode is None:
+            return True
+        return bool(st.available_mode & AVAILABLE_MODE_EMERGENCY)
+
+    def _discovery_signature(self):
+        """Everything discovery is built from — republish when it changes.
+
+        Discovery used to be published exactly once at startup, so flipping the
+        panel's aux switch never reached HA: the card kept its preset dropdown
+        (or lost it) until the bridge was restarted.
+        """
+        st = self.state
+        return (st.available_mode, st.aux_heat_open, st.temp_unit,
+                st.heating_max, st.cooling_min)
+
     def publish_discovery(self):
         st = self.state
         dev = {
@@ -608,8 +730,15 @@ class Bridge:
         for m, name in HVAC_FROM_MODE.items():
             if m == MODE_DRY:
                 continue                       # Option B — dry is not an HA mode
-            if st.available_mode is None or \
-               st.available_mode & AVAILABLE_MODE_BITS.get(m, 0):
+            bit = AVAILABLE_MODE_BITS.get(m)
+            # ⚠ An UNMAPPED mode must be KEPT, never hidden. The old code used
+            # `.get(m, 0)` and `available_mode & 0` is falsy, so any mode absent
+            # from the table silently vanished from the climate entity — the
+            # opposite of the documented policy, and it would have deleted HEAT
+            # (whose bit is still unknown) the moment available_mode began
+            # parsing. Caught by replaying real captures, 2026-08-16.
+            if st.available_mode is None or bit is None or \
+                    (st.available_mode & bit):
                 if name not in modes:
                     modes.append(name)
 
@@ -618,17 +747,14 @@ class Bridge:
             "device": dev, **avail,
             "modes": modes,
             "fan_modes": ["auto", "low", "medium", "high"],
-            "preset_modes": [PRESET_NORMAL, PRESET_EMERGENCY],
             "current_temperature_topic": self.t("current_temperature"),
             "temperature_state_topic": self.t("target_temperature"),
             "mode_state_topic": self.t("mode"),
             "fan_mode_state_topic": self.t("fan_mode"),
-            "preset_mode_state_topic": self.t("preset"),
             "action_topic": self.t("action"),
             "temperature_command_topic": self.t("set/target_temperature"),
             "mode_command_topic": self.t("set/mode"),
             "fan_mode_command_topic": self.t("set/fan_mode"),
-            "preset_mode_command_topic": self.t("set/preset"),
             "min_temp": st.cooling_min if st.cooling_min else 16,
             "max_temp": st.heating_max if st.heating_max else 30,
             "temp_step": 1.0,
@@ -636,6 +762,18 @@ class Bridge:
             # Verified 2026-08-15: switched to °F at the panel and HA followed.
             "temperature_unit": "F" if st.temp_unit else "C",
         }
+        # ── Emergency heat is offered ONLY when the panel allows it ──────────
+        # Settings → Auxiliary Heat is owned by the touchscreen and cannot be
+        # set remotely (meiju has GET/RESPONSE/NOTIFY for its UI state but no
+        # SET — 161 messages checked, 2026-08-16). We therefore MIRROR it:
+        # switch off → bit 3 of available_mode clears → the whole preset
+        # dropdown disappears from the HA card, so it cannot even be asked for.
+        # Switching it off while emergency is running powers the unit OFF; the
+        # device does that itself and we simply report it.
+        if self._emergency_available():
+            climate["preset_modes"] = [PRESET_NORMAL, PRESET_EMERGENCY]
+            climate["preset_mode_state_topic"] = self.t("preset")
+            climate["preset_mode_command_topic"] = self.t("set/preset")
         self.mqtt.publish(self.disc("climate", "climate"), json.dumps(climate),
                           retain=True)
 
@@ -665,7 +803,16 @@ class Bridge:
                "°C", "temperature")
         sensor("dry_remain", "Dry Mode Remaining", "dry_mode_remaining", "min",
                icon="mdi:timer-sand")
-        binary("aux_heat", "Aux Heat", "aux_heat", "mdi:heating-coil")
+        # ⚠ object_id `aux_heat` is KEPT (it seeds unique_id) so existing history
+        # survives — only the display name changes. What it always reported is
+        # "aux heat is PERMITTED in this mode" = the DIM corner icon.
+        binary("aux_heat", "Aux Heat Armed", "aux_heat", "mdi:heating-coil")
+        # The real thing: element energised, ~10 kW. = the BRIGHT corner icon.
+        binary("aux_heat_drawing", "Aux Heat Drawing", "aux_heat_drawing",
+               "mdi:heating-coil")
+        # The panel's Settings → Auxiliary Heat switch. Read-only by design.
+        binary("aux_allowed", "Aux Heat Allowed", "aux_allowed",
+               "mdi:toggle-switch-outline")
         binary("heat_pump", "Heat Pump", "heat_pump", "mdi:heat-pump")
 
         # Dry mode: button + duration, mirroring the panel (Option B)
@@ -699,9 +846,13 @@ class Bridge:
         self.mqtt.publish(self.disc("switch", "dry_mode"), json.dumps(sw),
                           retain=True)
 
-        LOG.info("HA discovery published (modes=%s, range=%s-%s)", modes,
-                 climate["min_temp"], climate["max_temp"])
+        LOG.info("HA discovery published (modes=%s, range=%s-%s, "
+                 "emergency preset=%s)", modes, climate["min_temp"],
+                 climate["max_temp"],
+                 "offered" if self._emergency_available() else
+                 "hidden (panel aux switch is OFF)")
         self._discovery_done = True
+        self._disc_sig = self._discovery_signature()
 
     # ── publish state ────────────────────────────────────────────────────
     def _confirm(self):
@@ -756,6 +907,10 @@ class Bridge:
         self.pub("dry_duration", st.dry_interval)
         if st.elec_heat is not None:
             self.pub("aux_heat", "ON" if st.elec_heat else "OFF")
+        if st.elec_heat_draw is not None:
+            self.pub("aux_heat_drawing", "ON" if st.elec_heat_draw else "OFF")
+        if st.aux_heat_open is not None:
+            self.pub("aux_allowed", "ON" if st.aux_heat_open else "OFF")
         if st.compressor is not None:
             self.pub("heat_pump", "ON" if st.compressor else "OFF")
         st.dirty.clear()
@@ -866,6 +1021,18 @@ class Bridge:
             # also sets the flag, but it does not notify meiju so the panel
             # stays stale; this path goes through `msmart_cmd_ctrl`, which does.
             emerg = (payload == PRESET_EMERGENCY)
+            # Belt and braces: with the panel's aux switch OFF the preset is not
+            # advertised at all, but a stale HA card or an automation written
+            # earlier could still fire this. The device would refuse it anyway —
+            # refuse it here so the reason ends up in the log instead of looking
+            # like a dropped command.
+            if emerg and not self._emergency_available():
+                LOG.warning("ignoring Emergency Heat request: the thermostat's "
+                            "Settings -> Auxiliary Heat switch is OFF "
+                            "(available_mode=0x%02x). It can only be turned "
+                            "back on at the panel.",
+                            self.state.available_mode or 0)
+                return
             # Emergency implies heat. Leaving it must NOT drag the user out of
             # whatever mode they are in, so reuse the current mode.
             mode = MODE_HEAT if emerg else (st.mode or MODE_HEAT)
@@ -1003,6 +1170,15 @@ class Bridge:
 
             if self.mqtt and self.mqtt.is_connected():
                 if not self._discovery_done and self.state.mode is not None:
+                    self.publish_discovery()
+                elif self._discovery_done and \
+                        self._discovery_signature() != self._disc_sig:
+                    # A capability changed — most often the owner flipping
+                    # Settings → Auxiliary Heat, which adds/removes the
+                    # emergency preset. Republish so the card changes shape.
+                    LOG.info("capabilities changed %s -> %s — republishing "
+                             "discovery", self._disc_sig,
+                             self._discovery_signature())
                     self.publish_discovery()
                 self.publish_state()
 
