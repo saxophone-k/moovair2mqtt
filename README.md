@@ -10,7 +10,7 @@ Home Assistant  ←→  MQTT  ←→  moovair2mqtt  ←→  thermostat (ADB, you
 
 > ## 🔀 v3 — 15 August 2026 — the bridge moved from the cloud to your LAN
 >
-> *Current release: **v3.0.1**.*
+> *Current release: **v3.1.0** — auxiliary heat reported properly, five fixes. See the [changelog](CHANGELOG.md).*
 >
 > **This is a breaking change.** Everything up to v2.1.0 controlled the thermostat through Midea's cloud, using your Moovair account. **v3 talks to the thermostat directly over your own network** — no account, no cloud, no internet required. It is roughly 50× faster, it no longer logs you out of the Moovair app, and it can do things the cloud API simply could not.
 >
@@ -50,12 +50,12 @@ What follows from that, and should be accepted before relying on this:
 
 ## What you get
 
-10 entities, published via MQTT discovery — they appear in Home Assistant on their own.
+12 entities, published via MQTT discovery — they appear in Home Assistant on their own.
 
 | Entity | Type | Notes |
 |---|---|---|
 | **Moovair** | Climate | Off / Auto / Cool / Heat / Fan only, fan Auto·Low·Med·High, whole degrees |
-| **Emergency Heat** | Climate preset | Heat pump bypassed, resistive element only |
+| **Emergency Heat** | Climate preset | Heat pump bypassed, resistive element only. Offered only while the panel allows auxiliary heat |
 | **Freeze Protection** | Switch | The panel's 8 °C freeze-protect mode (heat mode only) |
 | **Dry Mode** | Switch | Start / stop dehumidify |
 | **Dry Duration** | Number | 5–120 min, freely settable |
@@ -63,7 +63,9 @@ What follows from that, and should be accepted before relying on this:
 | **Indoor Humidity** | Sensor | % |
 | **Indoor Coil Temperature** | Sensor | °C |
 | **Outdoor Coil Temperature** | Sensor | °C — condenser when cooling, evaporator when heating |
-| **Aux Heat** | Binary sensor | The resistive element actually drawing power |
+| **Aux Heat Allowed** | Binary sensor | The panel's Settings → Auxiliary Heat switch |
+| **Aux Heat Armed** | Binary sensor | The element is permitted in the current mode |
+| **Aux Heat Drawing** | Binary sensor | **The element is actually energised** |
 | **Heat Pump** | Binary sensor | Compressor running |
 
 **It is fast.** State changes made at the panel appear in Home Assistant essentially instantly. Commands are injected in ~100–160 ms and confirmed by the device in ~200 ms.
@@ -73,6 +75,32 @@ What follows from that, and should be accepted before relying on this:
 - **Set any dry-mode duration.** The app offers four fixed buttons; the device accepts anything.
 - **Read indoor coil temperatures**, which the cloud never exposed.
 - **Run alongside the Moovair app**, because it never logs into your account.
+
+---
+
+## Auxiliary heat — why there are three sensors
+
+If your unit has the PTC resistive element, it is the single most expensive thing in the system to run — on the reference unit, around **10 kW**. Knowing when it is burning is the whole reason these sensors exist.
+
+The thermostat tracks **three different things**, and earlier versions of this bridge collapsed them into one sensor that was labelled as the wrong one. They are:
+
+| Entity | Question it answers | Panel equivalent |
+|---|---|---|
+| **Aux Heat Allowed** | Is the element armed at all, for the season? | Settings → Auxiliary Heat switch |
+| **Aux Heat Armed** | Is the element permitted in the mode I'm in right now? | Corner icon, **dim** |
+| **Aux Heat Drawing** | **Is the element burning power this second?** | Corner icon, **bright** |
+
+They nest: the element can only draw if it is armed, and can only be armed if it is allowed.
+
+**For an energy automation or a bill you're trying to understand, the one you want is `Aux Heat Drawing`.** *Armed* is on for most of the winter whether or not anything is firing — it means "the unit may use the element in this mode," not "it is using it."
+
+### The panel switch is the master control, and it is touchscreen-only
+
+**Settings → Auxiliary Heat** on the thermostat itself un-arms the element. With it off, the unit runs as a heat pump alone — useful if you have another heat source (baseboards, a furnace) that is cheaper to run than a 10 kW resistive element.
+
+**Home Assistant mirrors that switch; it cannot set it.** The thermostat's UI layer reports the setting and announces changes to it, but exposes no way to change it remotely — so this bridge deliberately reports it rather than pretending to control it. Set it once at the panel for the season.
+
+One visible consequence: **the Emergency Heat preset appears and disappears with that switch.** Turn it off and the preset — and the preset dropdown on the climate card — vanishes within seconds, because the thermostat genuinely stops offering emergency heat. Turn it back on and it returns. Plain **Heat is never removed**; the heat pump keeps working either way.
 
 ---
 
@@ -150,7 +178,7 @@ local one. It is about ten lines of configuration.
 
 ```yaml
 name: moovair2mqtt
-version: "3.0.1"
+version: "3.1.0"
 slug: moovair2mqtt
 description: Local control of a Moovair ST-1 thermostat, no cloud
 arch: [aarch64, amd64, armv7]
@@ -174,7 +202,7 @@ schema:
 `Dockerfile`:
 
 ```dockerfile
-ARG BUILD_FROM=ghcr.io/saxophone-k/moovair2mqtt:3.0.1
+ARG BUILD_FROM=ghcr.io/saxophone-k/moovair2mqtt:3.1.0
 FROM ${BUILD_FROM}
 USER root
 RUN pip install --no-cache-dir bashio 2>/dev/null || true
@@ -232,6 +260,7 @@ VLAN is reachable from Home Assistant.
 | `M2M_MQTT_PASSWORD` | | — | |
 | `M2M_MQTT_TOPIC_PREFIX` | | `moovair2mqtt` | State/command topic root |
 | `M2M_HA_DISCOVERY_PREFIX` | | `homeassistant` | Match your HA setting |
+| `M2M_MQTT_CLIENT_ID` | | derived from the prefix | Only needed if you run two instances against one broker |
 | `M2M_DEVICE_ID` | | derived from the IP | **Seeds every entity's `unique_id`.** See below |
 | `M2M_CLOUD_MODE` | | `alongside` | `alongside` or `local_only` |
 | `M2M_QUERY_INTERVAL` | | `60` | Safety-net re-query, seconds. `0` disables |
@@ -313,6 +342,10 @@ Because both sides are the vendor's own paths, the panel display, the phone app 
 **`ADB connection refused`** — confirm the thermostat's IP, and that whatever runs the bridge can route to it. If your thermostat is on an IoT VLAN, that VLAN must be reachable from the container's host.
 
 **Two thermostats in Home Assistant** — you changed `M2M_DEVICE_ID` or the topic prefix, so a second set of entities was created. Clear the old ones with the tool above.
+
+**The Emergency Heat preset vanished from the climate card** — that is deliberate. The thermostat's **Settings → Auxiliary Heat** switch is off, so the unit is not offering emergency heat and neither is the bridge. Turn it back on at the panel and the preset returns within seconds. See [Auxiliary heat](#auxiliary-heat--why-there-are-three-sensors).
+
+**My "Aux Heat" sensor still has the old name after upgrading to 3.1.0** — expected. It was renamed to *Aux Heat Armed*, but its entity ID is deliberately unchanged so your history and automations survive, and Home Assistant keeps whatever name it already had. Rename it in Settings → Devices if you want the new label. Note it means *"the element is permitted right now,"* not *"the element is burning"* — that one is the new **Aux Heat Drawing**.
 
 **The panel display does not follow Home Assistant** — please open an issue. Some commands notify the panel and some do not; the bridge deliberately routes everything the panel cares about through the channel that repaints it.
 

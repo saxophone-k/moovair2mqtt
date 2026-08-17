@@ -7,6 +7,9 @@ __pycache__/
 # Reverse-engineering working material — not part of the release.
 local_recon/
 
+# Local tooling config — not part of the release.
+.claude/
+
 # Internal working notes — never published.
 CLAUDE-moovair-local.md
 MOOVAIR_LOCAL_LOG.md
