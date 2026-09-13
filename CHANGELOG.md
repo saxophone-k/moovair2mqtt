@@ -7,6 +7,38 @@ All notable changes to this project are documented here.
 
 ---
 
+## [Unreleased]
+
+**Commands can no longer fail silently.** Found on 2026-09-13: Home Assistant
+showed the thermostat as healthy for about a day while every command was being
+dropped.
+
+### Fixed
+
+- **A copy of `msgtool` cut off halfway broke all control, with no error.** An
+  interrupted upload left a truncated `/tmp/msgtool` that the thermostat's ADB
+  service kept open, so every run failed with `Text file busy`. The bridge never
+  read msgtool's output and logged `injected` anyway. It now:
+  - checks msgtool actually replied `sent mtype=…`, and treats anything else as
+    a failed send;
+  - uploads to a temporary name, verifies the size, then renames it into place,
+    so a cut-off upload can never replace the working copy (renaming over a busy
+    file was verified on the device);
+  - reinstalls msgtool automatically if it stops working, then retries once;
+  - no longer re-uploads msgtool just because a connection hiccup made the
+    "is it installed?" check fail.
+
+### Added
+
+- **Availability now covers control, not just reading.** If commands can't be
+  delivered, the device goes **unavailable** in Home Assistant instead of looking
+  healthy. The periodic state query doubles as a health check (every 30 s while
+  broken), so it recovers on its own.
+- **Command Problem** (diagnostic binary sensor) — ON while commands can't be
+  delivered, or when 2+ commands in a row were delivered but never took effect.
+  It has no availability of its own, so it stays visible while the device is
+  unavailable.
+
 ## [3.1.0] — 2026-08-17
 
 **Auxiliary heat, done properly.** Home Assistant now reports the three genuinely

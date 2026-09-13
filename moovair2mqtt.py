@@ -39,6 +39,7 @@ LOG = logging.getLogger("moovair-local")
 
 MSQID = 1
 MSG_LEN = 1056                 # dev_app's fixed rac_queue message size
+PROBE_BROKEN_S = 30            # re-test a broken command channel this often
 
 TYPE_TLV = 0x30000             # Channel A — `aa .. 44` TLV frame
 TYPE_KV = 0                    # Channel B — key/value
@@ -270,6 +271,10 @@ def build_query() -> bytes:
 # ADB transport — pure Python, no platform-tools needed
 # ─────────────────────────────────────────────────────────────────────────────
 
+class SendError(RuntimeError):
+    """The command channel is reachable but a message could not be injected."""
+
+
 class Device:
     """
     TWO independent ADB connections.
@@ -336,26 +341,68 @@ class Device:
             return self.dev.shell(cmd, transport_timeout_s=timeout,
                                   read_timeout_s=timeout)
 
-    def ensure_msgtool(self):
-        """/tmp is volatile — re-push msgtool after every device reboot."""
-        try:
-            out = self.shell(f"[ -x {self.cfg.msgtool_remote} ] && echo ok")
-        except Exception:
-            out = ""
-        if "ok" in (out or ""):
-            return
-        if not os.path.exists(self.cfg.msgtool_local):
-            LOG.error("msgtool not found at %s — cannot send commands",
-                      self.cfg.msgtool_local)
-            return
-        LOG.info("Pushing msgtool to the thermostat (%s)", self.cfg.msgtool_remote)
-        with self._lock:
-            self.dev.push(self.cfg.msgtool_local, self.cfg.msgtool_remote)
-        self.shell(f"chmod +x {self.cfg.msgtool_remote}")
+    def _remote_size(self, path):
+        """Byte size of a file on the thermostat, or None if it is missing.
+        Raises on a transport error — the caller must NOT read that as 'missing'."""
+        out = (self.shell(f"[ -f {path} ] && wc -c < {path} || echo missing")
+               or "").strip()
+        return int(out) if out.isdigit() else None
 
-    def send(self, payload: bytes):
+    def ensure_msgtool(self):
+        """/tmp is volatile — re-push msgtool after every device reboot.
+
+        ⚠ 2026-09-13: commands silently died for a whole day. A push had been
+        cut off halfway (202 752 of 424 508 bytes) and adbd kept that file open
+        for writing forever, so every run failed with `Text file busy` — while
+        the bridge logged "injected". Two rules came out of that:
+          * only a SIZE match counts as installed (a truncated file passes `-x`);
+          * a failed check is a transport error, never proof the file is gone,
+            so it must not trigger a push over the live copy.
+        """
+        local = self.cfg.msgtool_local
+        if not os.path.exists(local):
+            raise SendError(f"msgtool not found at {local}")
+        want = os.path.getsize(local)
+        remote = self.cfg.msgtool_remote
+        if self._remote_size(remote) == want:      # raises on transport errors
+            return
+
+        # Push under a UNIQUE temp name, verify, then rename into place. A rename
+        # swaps in a new inode, so a push that dies halfway can only ever strand
+        # its own temp file — never the copy we execute.
+        tmp = f"/tmp/.msgtool.{int(time.time() * 1000)}"
+        LOG.info("Pushing msgtool to the thermostat (%s)", remote)
+        self.shell("rm -f /tmp/.msgtool.*")      # strays from earlier failed pushes
+        with self._lock:
+            self.dev.push(local, tmp)
+        got = self._remote_size(tmp)
+        if got != want:
+            self.shell(f"rm -f {tmp}")
+            raise SendError(f"msgtool push incomplete ({got} of {want} bytes)")
+        self.shell(f"chmod +x {tmp} && mv -f {tmp} {remote}")
+
+    def send(self, payload: bytes, _retry=True):
+        """Inject one message. Raises SendError unless msgtool reports success.
+
+        The old version ignored msgtool's output entirely, so a failing send
+        looked identical to a working one."""
         self.ensure_msgtool()
-        self.shell(f"{self.cfg.msgtool_remote} send {MSQID} {payload.hex()}")
+        out = (self.shell(f"{self.cfg.msgtool_remote} send {MSQID} "
+                          f"{payload.hex()} 2>&1") or "").strip()
+        if "sent mtype=" in out:
+            return
+        if "msgsnd err" in out:
+            # The tool ran fine; the kernel refused the message (e.g. queue
+            # full). Reinstalling would not help.
+            raise SendError(f"msgtool: {out}")
+        if _retry:
+            # Anything else means the tool itself is unusable (busy, truncated,
+            # corrupt). Throw the copy away and install a fresh one — exactly the
+            # manual fix that worked on 2026-09-13 — then try once more.
+            LOG.warning("msgtool failed (%s) — reinstalling it", out or "no output")
+            self.shell(f"rm -f {self.cfg.msgtool_remote}")
+            return self.send(payload, _retry=False)
+        raise SendError(f"msgtool: {out or 'no output'}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,7 +680,10 @@ class Bridge:
         self._disc_sig = None           # last-published discovery inputs
         self._stop = threading.Event()
         self._device_online = None      # None = unknown yet
+        self._reader_online = False     # the logread stream is delivering
+        self._cmd_ok = True             # the last injection succeeded
         self._pending = {}              # field -> (value, sent_at) for latency
+        self._unconfirmed = 0           # consecutive commands the device ignored
 
     # ── topics ───────────────────────────────────────────────────────────
     def t(self, leaf):
@@ -664,6 +714,9 @@ class Bridge:
         client.subscribe(self.t("set/#"))
         if self._device_online:
             client.publish(self.t("availability"), "online", retain=True)
+        bad = (not self._cmd_ok) or self._unconfirmed >= 2
+        client.publish(self.t("command_problem"), "ON" if bad else "OFF",
+                       retain=True)
         self._discovery_done = False
 
     def _on_message(self, client, userdata, msg):
@@ -672,10 +725,39 @@ class Bridge:
         LOG.info("command: %s = %s", leaf, payload)
         self.cmd_q.put((leaf, payload))
 
+    def set_reader_online(self, online: bool, why: str = ""):
+        self._reader_online = online
+        self._publish_availability(why)
+
+    def set_command_ok(self, ok: bool, why: str = ""):
+        """⚠ Reading and controlling are separate paths. On 2026-09-13 the
+        read stream was perfect for a day while every command failed, and HA
+        showed the thermostat as healthy the whole time. Availability now
+        requires BOTH."""
+        if self._cmd_ok != ok:
+            self._cmd_ok = ok
+            if ok:
+                LOG.warning("command channel RECOVERED")
+            else:
+                LOG.error("command channel BROKEN (%s)", why)
+            self._publish_command_problem()
+        self._publish_availability(why)
+
+    def _publish_command_problem(self):
+        """Diagnostic sensor: injections failing, OR the device ignoring
+        commands that were injected fine (2+ in a row)."""
+        if self.mqtt and self.mqtt.is_connected():
+            bad = (not self._cmd_ok) or self._unconfirmed >= 2
+            self.pub("command_problem", "ON" if bad else "OFF")
+
+    def _publish_availability(self, why=""):
+        self.set_device_online(self._reader_online and self._cmd_ok, why)
+
     def set_device_online(self, online: bool, why: str = ""):
         """Availability must reflect the THERMOSTAT, not just the bridge.
         The MQTT will only covers the bridge dying; if the device goes away
-        (power cut, WiFi drop) we must publish 'offline' ourselves."""
+        (power cut, WiFi drop) we must publish 'offline' ourselves.
+        Call set_reader_online / set_command_ok rather than this directly."""
         if self._device_online == online:
             return
         self._device_online = online
@@ -815,6 +897,17 @@ class Bridge:
                "mdi:toggle-switch-outline")
         binary("heat_pump", "Heat Pump", "heat_pump", "mdi:heat-pump")
 
+        # ⚠ Deliberately NO availability: it must stay readable exactly when
+        # the rest of the device has gone unavailable because commands broke.
+        cmd_problem = {
+            "name": "Command Problem",
+            "unique_id": f"moovair_{self.cfg.device_id}_command_problem",
+            "device": dev, "state_topic": self.t("command_problem"),
+            "payload_on": "ON", "payload_off": "OFF",
+            "device_class": "problem", "entity_category": "diagnostic"}
+        self.mqtt.publish(self.disc("binary_sensor", "command_problem"),
+                          json.dumps(cmd_problem), retain=True)
+
         # Dry mode: button + duration, mirroring the panel (Option B)
         num = {"name": "Dry Duration",
                "unique_id": f"moovair_{self.cfg.device_id}_dry_duration",
@@ -878,10 +971,15 @@ class Bridge:
                 LOG.info("✓ device confirmed %s=%s after %.0f ms", leaf, want,
                          (time.time() - sent) * 1000)
                 self._pending.pop(leaf, None)
+                if self._unconfirmed:
+                    self._unconfirmed = 0
+                    self._publish_command_problem()
             elif time.time() - sent > 20:
                 LOG.warning("✗ device did NOT confirm %s=%s within 20s "
                             "(device reports %s)", leaf, want, got)
                 self._pending.pop(leaf, None)
+                self._unconfirmed += 1
+                self._publish_command_problem()
 
     def publish_state(self, force=False):
         st = self.state
@@ -1102,11 +1200,11 @@ class Bridge:
                     with self._state_lock:
                         for line in chunk.splitlines():
                             parse_line(line, self.state)
-                    if chunk:
-                        self.set_device_online(True, "log stream active")
+                    if chunk and not self._reader_online:
+                        self.set_reader_online(True, "log stream active")
             except Exception as exc:
                 LOG.warning("read stream lost (%s) — reconnecting in 5s", exc)
-                self.set_device_online(False, "read stream lost")
+                self.set_reader_online(False, "read stream lost")
                 self.device.close_reader()
                 self._stop.wait(5)
 
@@ -1118,10 +1216,16 @@ class Bridge:
         try:
             self.device.connect()
             self.device.send(build_query())          # resync on (re)connect
+            self.set_command_ok(True)
+            return True
+        except SendError as exc:
+            # Connected, but injection is broken. Keep the connection — the
+            # worker re-probes it every PROBE_BROKEN_S.
+            self.set_command_ok(False, str(exc))
             return True
         except Exception as exc:
             LOG.warning("command channel unavailable (%s)", exc)
-            self.device.dev = None
+            self.device.close_command()
             return False
 
     def worker_loop(self):
@@ -1144,6 +1248,10 @@ class Bridge:
                     LOG.info("command %s=%s injected in %.0f ms", leaf, payload,
                              (time.time() - t0) * 1000)
                     self._pending[leaf] = (payload, time.time())
+                    self.set_command_ok(True)
+                except SendError as exc:
+                    LOG.error("command %s=%s NOT delivered: %s", leaf, payload, exc)
+                    self.set_command_ok(False, str(exc))
                 except Exception as exc:
                     LOG.error("command %s failed: %s", leaf, exc)
                     self.device.close_command()      # force a fresh connection
@@ -1156,15 +1264,21 @@ class Bridge:
                 LOG.warning("no sensor data for %.0fs — the log stream looks "
                             "dead; forcing reconnect",
                             now - self.state.last_seen)
-                self.set_device_online(False, "no sensor data")
+                self.set_reader_online(False, "no sensor data")
                 self.state.last_seen = 0
                 self.device.close()
 
-            if self.cfg.query_interval > 0 and self.device.dev and \
-                    now - last_query >= self.cfg.query_interval:
+            # The periodic query doubles as a health check of the WRITE path, so
+            # a broken injector is caught even when nobody is sending commands.
+            # While broken, probe faster so control comes back on its own.
+            interval = PROBE_BROKEN_S if not self._cmd_ok else self.cfg.query_interval
+            if interval > 0 and self.device.dev and now - last_query >= interval:
                 last_query = now
                 try:
                     self.device.send(build_query())     # READ-ONLY resync
+                    self.set_command_ok(True)
+                except SendError as exc:
+                    self.set_command_ok(False, str(exc))
                 except Exception as exc:
                     LOG.debug("query failed: %s", exc)
 
