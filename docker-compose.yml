@@ -43,6 +43,7 @@ services:
       # 0 disables it entirely.
       M2M_QUERY_INTERVAL: "60"
       M2M_HEARTBEAT_TIMEOUT: "30"
+      M2M_READ_TIMEOUT: "120"
 
       # "alongside" = coexists with the Moovair phone app (the whole reason the
       # local bridge beats the cloud one). "local_only" for a device firewalled

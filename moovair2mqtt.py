@@ -164,6 +164,22 @@ class Config:
         # deliberately do not hammer the device. 0 disables it entirely.
         self.query_interval = float(_env("M2M_QUERY_INTERVAL", "60"))
         self.heartbeat_timeout = float(_env("M2M_HEARTBEAT_TIMEOUT", "30"))
+        # How long the `logread -f` tail may sit QUIET before we treat the ADB
+        # transport itself as broken. This is a transport bound, NOT a health
+        # check — health is heartbeat_timeout above, which measures whether
+        # useful SENSOR data is arriving, and is the right detector.
+        #
+        # ⚠ Do not lower this. adb_shell defaults read_timeout_s to 10 s, and
+        # leaving it at the default is what produced the reconnect storm seen
+        # in captures/bridge-log-20260923.log: over 2026-09-13..23 the 10 s
+        # timeout fired 1 377 times, forcing 1 368 full reconnects (~7/h),
+        # while the 30 s heartbeat fired only 4 times. So the log routinely
+        # goes quiet past 10 s and almost never past 30 s — every one of those
+        # 1 368 teardowns was a FALSE POSITIVE on a healthy link (the Omada
+        # client page showed −46 dBm, SNR 49 dB, association unbroken across
+        # the whole window). Reconnecting is not free: each cycle costs the
+        # module real work, and it runs at load average ~4 already.
+        self.read_timeout = float(_env("M2M_READ_TIMEOUT", "120"))
         self.msgtool_local = _env("M2M_MSGTOOL_PATH", "/app/msgtool")
         self.msgtool_remote = "/tmp/msgtool"
         # Seeds every Home Assistant unique_id, so it must stay STABLE for the
@@ -681,6 +697,7 @@ class Bridge:
         self._stop = threading.Event()
         self._device_online = None      # None = unknown yet
         self._reader_online = False     # the logread stream is delivering
+        self._reader_reconnects = 0     # cumulative; its RATE is the diagnostic
         self._cmd_ok = True             # the last injection succeeded
         self._pending = {}              # field -> (value, sent_at) for latency
         self._unconfirmed = 0           # consecutive commands the device ignored
@@ -1189,8 +1206,10 @@ class Bridge:
             try:
                 rdev = self.device.connect_reader()
                 LOG.info("tailing logread")
-                for chunk in rdev.streaming_shell("logread -f",
-                                                  transport_timeout_s=None):
+                for chunk in rdev.streaming_shell(
+                        "logread -f",
+                        transport_timeout_s=None,
+                        read_timeout_s=self.cfg.read_timeout):
                     if self._stop.is_set():
                         break
                     # One acquire per chunk, not per line: `logread` delivers
@@ -1203,7 +1222,12 @@ class Bridge:
                     if chunk and not self._reader_online:
                         self.set_reader_online(True, "log stream active")
             except Exception as exc:
-                LOG.warning("read stream lost (%s) — reconnecting in 5s", exc)
+                # Counted because the RATE is the diagnostic: a healthy link
+                # should reconnect a handful of times a week, not 1 368 times
+                # in 8 days (see the M2M_READ_TIMEOUT note in Config).
+                self._reader_reconnects += 1
+                LOG.warning("read stream lost (%s) — reconnecting in 5s "
+                            "[reconnect #%d]", exc, self._reader_reconnects)
                 self.set_reader_online(False, "read stream lost")
                 self.device.close_reader()
                 self._stop.wait(5)
@@ -1330,6 +1354,8 @@ def main():
                  "work (it is AccuWeather data fetched via the cloud).")
     LOG.info("moovair2mqtt v3 (local) starting — thermostat %s:%s",
              cfg.thermostat_host, cfg.thermostat_port)
+    LOG.info("read stream: quiet tolerated up to %.0fs, sensor-data heartbeat "
+             "%.0fs", cfg.read_timeout, cfg.heartbeat_timeout)
     Bridge(cfg).run()
 
 

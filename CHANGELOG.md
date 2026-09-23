@@ -28,6 +28,34 @@ dropped.
   - no longer re-uploads msgtool just because a connection hiccup made the
     "is it installed?" check fail.
 
+### Fixed (2026-09-23)
+
+- **The bridge was reconnecting to the thermostat roughly 170 times a day for
+  no reason.** The `logread` tail inherited `adb_shell`'s default 10-second read
+  timeout, so any quiet stretch on the thermostat's log — which is normal once
+  the unit settles — was mistaken for a dead connection and the ADB session was
+  torn down and rebuilt.
+
+  Measured over 2026-09-13→23 (`captures/bridge-log-20260923.log`): the 10 s
+  timeout fired **1 377 times**, forcing **1 368 full reconnects**, while the
+  30-second sensor-data heartbeat fired **4 times**. The log routinely goes
+  quiet past 10 s and almost never past 30 s, so essentially every one of those
+  reconnects was a false alarm on a perfectly healthy link — the access point
+  reported −46 dBm with the association unbroken across the entire window.
+
+  The tail now tolerates quiet for `M2M_READ_TIMEOUT` seconds (default **120**).
+  Health is still judged by the 30-second heartbeat, which measures whether
+  useful *sensor data* is arriving — the right question to ask. Reconnects are
+  now numbered in the log (`[reconnect #N]`), because the rate is the
+  diagnostic.
+
+  ⚠ **This is a suspected — not proven — cause of the ADB service dying
+  outright** (seen 2026-08-21 and again 2026-09-21 19:03:44, each needing a
+  breaker power-cycle because nothing restarts it). Reconnecting costs the
+  module real work and it already runs at load average ~4. Eliminating the
+  needless reconnects is also a clean experiment: if the service still dies,
+  the bridge is exonerated.
+
 ### Added
 
 - **Availability now covers control, not just reading.** If commands can't be

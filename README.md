@@ -265,6 +265,7 @@ VLAN is reachable from Home Assistant.
 | `M2M_CLOUD_MODE` | | `alongside` | `alongside` or `local_only` |
 | `M2M_QUERY_INTERVAL` | | `60` | Safety-net re-query, seconds. `0` disables |
 | `M2M_HEARTBEAT_TIMEOUT` | | `30` | Seconds of silence before marking the device offline |
+| `M2M_READ_TIMEOUT` | | `120` | Seconds the log tail may sit quiet before the ADB transport is treated as broken. **Don't lower it** — 10 s (the library default) caused ~170 needless reconnects a day |
 | `M2M_LOG_LEVEL` | | `info` | `debug` is very noisy |
 
 ### `M2M_DEVICE_ID` — the one to think about
