@@ -1206,9 +1206,13 @@ class Bridge:
             try:
                 rdev = self.device.connect_reader()
                 LOG.info("tailing logread")
+                # Both timeouts must be set. transport_timeout_s=None does NOT
+                # mean "no timeout": adb_shell swaps it for the connection's
+                # default_transport_timeout_s (15 s, see _new), which is what
+                # still dropped the stream after the 2026-09-23 fix.
                 for chunk in rdev.streaming_shell(
                         "logread -f",
-                        transport_timeout_s=None,
+                        transport_timeout_s=self.cfg.read_timeout,
                         read_timeout_s=self.cfg.read_timeout):
                     if self._stop.is_set():
                         break

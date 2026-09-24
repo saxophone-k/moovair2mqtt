@@ -56,6 +56,14 @@ dropped.
   needless reconnects is also a clean experiment: if the service still dies,
   the bridge is exonerated.
 
+### Fixed (2026-09-24)
+
+- **The 120-second quiet tolerance above never actually applied.** The tail
+  passed `transport_timeout_s=None`, expecting "no limit", but `adb_shell`
+  replaces `None` with the connection's 15-second default. So the limit only
+  went from 10 s to 15 s: the first night still logged 14 reconnects, every one
+  `timed out (15.0 seconds)`. Both timeouts now use `M2M_READ_TIMEOUT`.
+
 ### Added
 
 - **Availability now covers control, not just reading.** If commands can't be
