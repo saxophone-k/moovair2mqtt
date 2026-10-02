@@ -10,7 +10,7 @@ Home Assistant  ←→  MQTT  ←→  moovair2mqtt  ←→  thermostat (ADB, you
 
 > ## 🔀 v3 — 15 August 2026 — the bridge moved from the cloud to your LAN
 >
-> *Current release: **v3.2.0** — commands can no longer fail silently, and ~140× fewer needless reconnects. See the [changelog](CHANGELOG.md).*
+> *Current release: **v3.2.1** — faster, cleaner recovery when the thermostat reboots. See the [changelog](CHANGELOG.md).*
 >
 > **This is a breaking change.** Everything up to v2.1.0 controlled the thermostat through Midea's cloud, using your Moovair account. **v3 talks to the thermostat directly over your own network** — no account, no cloud, no internet required. It is roughly 50× faster, it no longer logs you out of the Moovair app, and it can do things the cloud API simply could not.
 >
@@ -178,7 +178,7 @@ local one. It is about ten lines of configuration.
 
 ```yaml
 name: moovair2mqtt
-version: "3.2.0"
+version: "3.2.1"
 slug: moovair2mqtt
 description: Local control of a Moovair ST-1 thermostat, no cloud
 arch: [aarch64, amd64, armv7]
@@ -202,7 +202,7 @@ schema:
 `Dockerfile`:
 
 ```dockerfile
-ARG BUILD_FROM=ghcr.io/saxophone-k/moovair2mqtt:3.2.0
+ARG BUILD_FROM=ghcr.io/saxophone-k/moovair2mqtt:3.2.1
 FROM ${BUILD_FROM}
 USER root
 RUN pip install --no-cache-dir bashio 2>/dev/null || true

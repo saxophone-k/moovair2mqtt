@@ -2,12 +2,23 @@
 
 All notable changes to this project are documented here.
 
-> **⚠ Image tags drop the `v`.** Git tag `v3.2.0` publishes the image
-> `ghcr.io/saxophone-k/moovair2mqtt:3.2.0`. There is no `:v3.2.0`.
+> **⚠ Image tags drop the `v`.** Git tag `v3.2.1` publishes the image
+> `ghcr.io/saxophone-k/moovair2mqtt:3.2.1`. There is no `:v3.2.1`.
 
 ---
 
 ## [Unreleased]
+
+## [3.2.1] — 2026-10-02
+
+**Recovering from a thermostat reboot is now faster and cleaner.** Tested by
+power-cycling the unit at the breaker twice: once partway through these fixes,
+and once with all of them in. On the final run, the log stream restarted in the
+same millisecond the watchdog fired, where the first run took 82 s. The command
+side reconnected in 22 ms, `msgtool` was reinstalled in 4 s with no `Text file
+busy`, and the thermostat was back online about 50 s after it went quiet, down
+from about 126 s. `Text file busy` had only been seen once before, so two clean
+reboots are strong evidence that it is fixed, not proof.
 
 ### Fixed
 
