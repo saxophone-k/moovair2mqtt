@@ -2,16 +2,32 @@
 
 All notable changes to this project are documented here.
 
-> **⚠ Image tags drop the `v`.** Git tag `v3.1.0` publishes the image
-> `ghcr.io/saxophone-k/moovair2mqtt:3.1.0`. There is no `:v3.1.0`.
+> **⚠ Image tags drop the `v`.** Git tag `v3.2.0` publishes the image
+> `ghcr.io/saxophone-k/moovair2mqtt:3.2.0`. There is no `:v3.2.0`.
 
 ---
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-10-02
+
 **Commands can no longer fail silently.** Found on 2026-09-13: Home Assistant
 showed the thermostat as healthy for about a day while every command was being
 dropped.
+
+**Soak-tested for 8 days before release** (2026-09-24 → 10-02): **10
+reconnects** in total, down from ~170 a day, and every scheduled command was
+delivered and confirmed in about 200 ms. Nine of the ten were the 30-second
+heartbeat correctly restarting the log stream after a quiet spell. They show
+up in the log as `argument must be an int, or have a fileno() method`. That
+message looks alarming but is harmless, and it will be cleaned up.
+
+### Known issue
+
+- **Right after the thermostat reboots**, the first run of the freshly uploaded
+  `msgtool` can fail with `Text file busy`. The bridge reinstalls it and
+  recovers by itself (seen once, 2026-10-02). A fix is
+  in progress on `dev`.
 
 ### Fixed
 
