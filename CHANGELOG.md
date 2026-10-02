@@ -9,6 +9,29 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`Text file busy` right after the thermostat reboots** (the 3.2.0 known
+  issue). A fresh upload of `msgtool` passed its size check and still could not
+  run. Renaming a file keeps it the same file underneath, so if the thermostat's
+  ADB service still had the upload open, the installed copy was "busy" too. The
+  bridge now `cp`s the upload to a brand-new file before installing it. Nothing
+  else ever had that copy open.
+- **Uploading `msgtool` gave up after 10 seconds.** That limit was a library
+  default we never set, and a just-rebooted thermostat can be slower than that.
+  It is now 60 seconds.
+- **Command Problem could read OFF while commands were impossible.** If the
+  command connection couldn't even be opened, or a command or the periodic
+  check failed with a connection error, the sensor was never turned on. All
+  three cases now turn it on, and the device shows as unavailable until the
+  connection comes back.
+- **The heartbeat watchdog dropped the command connection for no reason.** When
+  the thermostat's log went quiet, the watchdog hung up *both* connections,
+  even though only the log stream needed restarting. It now restarts only the
+  log stream, and logs it as `read stream restarted by the heartbeat watchdog`
+  instead of the misleading `argument must be an int, or have a fileno()
+  method`.
+
 ## [3.2.0] — 2026-10-02
 
 **Commands can no longer fail silently.** Found on 2026-09-13: Home Assistant

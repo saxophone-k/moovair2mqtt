@@ -40,6 +40,7 @@ LOG = logging.getLogger("moovair-local")
 MSQID = 1
 MSG_LEN = 1056                 # dev_app's fixed rac_queue message size
 PROBE_BROKEN_S = 30            # re-test a broken command channel this often
+PUSH_TIMEOUT_S = 60.0          # uploading msgtool (424 KB) to a busy module
 
 TYPE_TLV = 0x30000             # Channel A — `aa .. 44` TLV frame
 TYPE_KV = 0                    # Channel B — key/value
@@ -389,13 +390,28 @@ class Device:
         tmp = f"/tmp/.msgtool.{int(time.time() * 1000)}"
         LOG.info("Pushing msgtool to the thermostat (%s)", remote)
         self.shell("rm -f /tmp/.msgtool.*")      # strays from earlier failed pushes
+        # ⚠ push() has its OWN read_timeout_s=10 default. 424 KB to a module
+        # that has just rebooted can take longer, and on 2026-10-02 the re-push
+        # died with `timed out (10.0 seconds)`.
         with self._lock:
-            self.dev.push(local, tmp)
+            self.dev.push(local, tmp, transport_timeout_s=PUSH_TIMEOUT_S,
+                          read_timeout_s=PUSH_TIMEOUT_S)
         got = self._remote_size(tmp)
         if got != want:
             self.shell(f"rm -f {tmp}")
             raise SendError(f"msgtool push incomplete ({got} of {want} bytes)")
-        self.shell(f"chmod +x {tmp} && mv -f {tmp} {remote}")
+        # ⚠ 2026-10-02: a push that had COMPLETED (size verified) still failed
+        # its first run with `Text file busy`. A rename keeps the same inode, so
+        # if adbd still holds the pushed file open for writing, the renamed copy
+        # is busy too. `cp` writes a fresh inode that adbd never touched, and cp
+        # has exited (file closed) before we run it.
+        run = f"{tmp}.run"
+        self.shell(f"cp {tmp} {run} && rm -f {tmp} && chmod +x {run}")
+        got = self._remote_size(run)
+        if got != want:
+            self.shell(f"rm -f {tmp} {run}")
+            raise SendError(f"msgtool copy incomplete ({got} of {want} bytes)")
+        self.shell(f"mv -f {run} {remote}")
 
     def send(self, payload: bytes, _retry=True):
         """Inject one message. Raises SendError unless msgtool reports success.
@@ -698,6 +714,7 @@ class Bridge:
         self._device_online = None      # None = unknown yet
         self._reader_online = False     # the logread stream is delivering
         self._reader_reconnects = 0     # cumulative; its RATE is the diagnostic
+        self._reader_kicked = False     # set when the watchdog closes the stream
         self._cmd_ok = True             # the last injection succeeded
         self._pending = {}              # field -> (value, sent_at) for latency
         self._unconfirmed = 0           # consecutive commands the device ignored
@@ -1205,6 +1222,7 @@ class Bridge:
         while not self._stop.is_set():
             try:
                 rdev = self.device.connect_reader()
+                self._reader_kicked = False
                 LOG.info("tailing logread")
                 # Both timeouts must be set. transport_timeout_s=None does NOT
                 # mean "no timeout": adb_shell swaps it for the connection's
@@ -1230,8 +1248,14 @@ class Bridge:
                 # should reconnect a handful of times a week, not 1 368 times
                 # in 8 days (see the M2M_READ_TIMEOUT note in Config).
                 self._reader_reconnects += 1
-                LOG.warning("read stream lost (%s) — reconnecting in 5s "
-                            "[reconnect #%d]", exc, self._reader_reconnects)
+                if self._reader_kicked:
+                    LOG.warning("read stream restarted by the heartbeat "
+                                "watchdog — reconnecting in 5s [reconnect #%d]",
+                                self._reader_reconnects)
+                else:
+                    LOG.warning("read stream lost (%s) — reconnecting in 5s "
+                                "[reconnect #%d]", exc, self._reader_reconnects)
+                self._reader_kicked = False
                 self.set_reader_online(False, "read stream lost")
                 self.device.close_reader()
                 self._stop.wait(5)
@@ -1252,7 +1276,11 @@ class Bridge:
             self.set_command_ok(False, str(exc))
             return True
         except Exception as exc:
+            # ⚠ This path used to leave _cmd_ok untouched, so a channel that
+            # could not even connect still showed Command Problem OFF and the
+            # device available (seen 2026-10-02 15:30).
             LOG.warning("command channel unavailable (%s)", exc)
+            self.set_command_ok(False, str(exc))
             self.device.close_command()
             return False
 
@@ -1282,6 +1310,7 @@ class Bridge:
                     self.set_command_ok(False, str(exc))
                 except Exception as exc:
                     LOG.error("command %s failed: %s", leaf, exc)
+                    self.set_command_ok(False, str(exc))
                     self.device.close_command()      # force a fresh connection
             except queue.Empty:
                 pass
@@ -1294,7 +1323,13 @@ class Bridge:
                             now - self.state.last_seen)
                 self.set_reader_online(False, "no sensor data")
                 self.state.last_seen = 0
-                self.device.close()
+                # Restart the READ stream only. Closing both channels (as before)
+                # also dropped a healthy command channel. Closing the socket the
+                # reader is blocked on is what makes it raise; the flag lets it
+                # log that as the restart it is, not as a mysterious
+                # `argument must be an int, or have a fileno() method`.
+                self._reader_kicked = True
+                self.device.close_reader()
 
             # The periodic query doubles as a health check of the WRITE path, so
             # a broken injector is caught even when nobody is sending commands.
@@ -1308,7 +1343,11 @@ class Bridge:
                 except SendError as exc:
                     self.set_command_ok(False, str(exc))
                 except Exception as exc:
-                    LOG.debug("query failed: %s", exc)
+                    # A transport error here means the channel is gone. Say so,
+                    # and reconnect — the reconnect's own query clears the flag.
+                    LOG.warning("query failed: %s", exc)
+                    self.set_command_ok(False, str(exc))
+                    self.device.close_command()
 
             if self.mqtt and self.mqtt.is_connected():
                 if not self._discovery_done and self.state.mode is not None:
