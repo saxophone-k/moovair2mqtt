@@ -31,6 +31,17 @@ All notable changes to this project are documented here.
   log stream, and logs it as `read stream restarted by the heartbeat watchdog`
   instead of the misleading `argument must be an int, or have a fileno()
   method`.
+- **When the thermostat dropped off, commands froze for up to 2 minutes.**
+  `adb_shell` holds a lock for as long as it waits on the log stream, and
+  closing that stream needs the same lock. So the watchdog, which runs on the
+  command thread, waited for the read to time out: up to `M2M_READ_TIMEOUT`
+  (120 s). Seen during a breaker test on 2026-10-02: 82 s with no command
+  retries. Introduced in 3.2.0 by the longer read timeout (it used to be
+  ≤15 s). The watchdog now cuts and closes the socket itself without the lock.
+  Measured inside the container: it returns at once, and the stream stops
+  within milliseconds instead of 18 s. Cutting without closing would have
+  left `adb_shell` spinning at 100 % CPU until the timeout, so both steps are
+  done.
 
 ## [3.2.0] — 2026-10-02
 

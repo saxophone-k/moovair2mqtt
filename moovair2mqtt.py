@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import re
+import socket
 import struct
 import sys
 import threading
@@ -344,6 +345,36 @@ class Device:
         except Exception:
             pass
         self.rdev = None
+
+    def kick_reader(self):
+        """Interrupt the read stream from ANOTHER thread, without waiting.
+
+        ⚠ close_reader() cannot do this. adb_shell holds its transport lock for
+        the whole socket wait, and close() needs that same lock, so calling it
+        from the worker froze the COMMAND thread until the reader's read timed
+        out — up to M2M_READ_TIMEOUT (120 s). Seen after the 2026-10-02 breaker
+        test: 82 s with no command retries.
+
+        So go under the lock, to the raw socket. Both steps are needed —
+        measured on Linux, in the container, with adb_shell 0.4.4:
+          * shutdown() wakes the blocked select, but on its own each read then
+            returns 0 bytes and adb_shell spins at 100 % CPU until the timeout;
+          * close() makes the next read fail at once (EBADF), so it exits.
+        The reader then runs close_reader() itself, when the lock is free.
+        """
+        try:
+            sock = self.rdev._io_manager._transport._connection
+        except AttributeError:
+            # Not connected, or adb_shell's internals changed (pinned to 0.4.4).
+            # The reader still ends at its own timeout; we just can't hurry it.
+            return
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        sock.close()
 
     def close_command(self):
         try:
@@ -1324,12 +1355,12 @@ class Bridge:
                 self.set_reader_online(False, "no sensor data")
                 self.state.last_seen = 0
                 # Restart the READ stream only. Closing both channels (as before)
-                # also dropped a healthy command channel. Closing the socket the
-                # reader is blocked on is what makes it raise; the flag lets it
-                # log that as the restart it is, not as a mysterious
+                # also dropped a healthy command channel. kick_reader() never
+                # blocks this thread (see its docstring); the flag lets the
+                # reader log the restart for what it is, not as a mysterious
                 # `argument must be an int, or have a fileno() method`.
                 self._reader_kicked = True
-                self.device.close_reader()
+                self.device.kick_reader()
 
             # The periodic query doubles as a health check of the WRITE path, so
             # a broken injector is caught even when nobody is sending commands.
